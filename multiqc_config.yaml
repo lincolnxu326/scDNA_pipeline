@@ -1,0 +1,183 @@
+# MultiQC Configuration for Single-Cell DNA Pipeline
+# This file configures how MultiQC processes and displays QC metrics
+
+title: "Single-Cell DNA Sequencing QC Report"
+subtitle: "Comprehensive quality metrics for scDNA-seq analysis"
+intro_text: |
+  This report summarizes quality control metrics for the single-cell DNA sequencing pipeline.
+  The analysis includes demultiplexing, deduplication, adapter filtering, and alignment statistics.
+
+report_comment: |
+  Generated using the scDNA sequencing pipeline. For issues, check the log files.
+
+# File search patterns
+sp:
+  fastqc:
+    fn: "*_fastqc.zip"
+  samtools:
+    fn_re: ".*(stats|flagstat)\\.txt$"
+  bowtie2:
+    fn: "*.log"
+    contents: "reads; of these:"
+  custom_data:
+    demux:
+      fn: "demux_stats.json"
+    dedup:
+      fn: "dedup_summary.tsv"
+    adapter:
+      fn: "adapter_filter_summary.tsv"
+
+# Custom data parsing
+custom_data:
+  demux_stats:
+    id: 'demux_stats'
+    section_name: 'Demultiplexing Statistics'
+    description: 'Read distribution across wells after demultiplexing'
+    plot_type: 'bargraph'
+    pconfig:
+      title: 'Demultiplexed Reads per Well'
+      ylab: 'Number of Reads'
+      
+  dedup_stats:
+    id: 'dedup_stats'
+    section_name: 'Deduplication Statistics'
+    description: 'PCR duplicate removal statistics'
+    plot_type: 'table'
+    headers:
+      dedup_rate:
+        title: 'Duplication Rate'
+        description: 'Percentage of duplicate reads'
+        format: '{:,.1f}%'
+        scale: 'RdYlGn-rev'
+        max: 100
+        min: 0
+      unique_reads:
+        title: 'Unique Reads'
+        description: 'Number of unique reads after deduplication'
+        format: '{:,.0f}'
+        
+  adapter_stats:
+    id: 'adapter_stats'
+    section_name: 'Adapter Filtering'
+    description: 'Adapter dimer contamination statistics'
+    plot_type: 'bargraph'
+    pconfig:
+      title: 'Adapter Contamination Rate'
+      ylab: 'Percentage'
+      max: 100
+      min: 0
+      colors:
+        kept: '#5cb85c'
+        removed: '#d9534f'
+
+# Module order
+module_order:
+  - fastqc
+  - custom_data
+  - samtools
+  - bowtie2
+
+# Exclude patterns (files to ignore)
+fn_ignore_files:
+  - "*.bam"
+  - "*.bai"
+  - "*unassigned*"
+
+fn_ignore_dirs:
+  - "*/aneufinder/*"
+  - "*/logs/*"
+  - "*/benchmarks/*"
+
+# Sample name cleaning
+fn_clean_sample_names:
+  - regex: '_R[12]\.filtered'
+    repl: ''
+  - regex: '\.dedup'
+    repl: ''
+  - regex: '_fastqc'
+    repl: ''
+
+# Report sections to show
+report_section_order:
+  demux_stats:
+    order: 100
+  dedup_stats:
+    order: 200
+  adapter_stats:
+    order: 300
+  fastqc:
+    order: 400
+  samtools:
+    order: 500
+  bowtie2:
+    order: 600
+
+# Table columns to show
+table_columns_visible:
+  FastQC:
+    percent_duplicates: True
+    percent_gc: True
+    avg_sequence_length: True
+    total_sequences: True
+    percent_fails: True
+  Samtools Stats:
+    mapped_passed: True
+    properly_paired_passed: True
+    pairs_on_different_chromosomes_passed: True
+    raw_total_sequences: True
+  Bowtie2:
+    overall_alignment_rate: True
+    aligned_exactly_1_time: True
+    aligned_gt_1_time: True
+
+# Thresholds for highlighting
+table_cond_formatting_rules:
+  high_duplication:
+    description: 'Highlight high duplication rates'
+    col: 'dedup_rate'
+    min: 50
+    max: 100
+    scale: 'RdYlGn-rev'
+
+  low_mapping:
+    description: 'Highlight low mapping rates'
+    col: 'overall_alignment_rate'
+    min: 0
+    max: 70
+    scale: 'RdYlGn'
+
+  high_adapter:
+    description: 'Highlight high adapter contamination'
+    col: 'adapter_rate'
+    min: 10
+    max: 100
+    scale: 'RdYlGn-rev'
+
+
+# Export settings
+export_plots: true
+plots_force_flat: false
+plots_force_interactive: false
+data_dir_name: 'multiqc_data'
+
+# Decimalpoint format
+decimalPoint_format: ','
+thousandsSep_format: ' '
+
+# Pipeline metadata
+report_header_info:
+  - Pipeline: 'scDNA-seq Analysis'
+  - Version: '2.0'
+  - Contact: 'Single-Cell Genomics Core'
+  - Reference: 'GRCh38'
+
+# Custom logo (optional)
+# custom_logo: 'path/to/logo.png'
+# custom_logo_url: 'https://www.example.com'
+# custom_logo_title: 'Organization Name'
+
+# Max table rows to show
+max_table_rows: 500
+
+# Log file parsing
+log_filesize_limit: 10000000  # 10MB

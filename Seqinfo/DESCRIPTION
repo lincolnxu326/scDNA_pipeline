@@ -1,0 +1,10 @@
+Package: Seqinfo
+Version: 0.0.1
+Title: Minimal Seqinfo for rtracklayer devel on HPC
+Description: Provides a minimal Seqinfo S4 class and constructor so that
+    rtracklayer from GitHub can install on a Bioconductor 3.20 setup.
+Authors@R: person("HPC", "User", role = c("aut","cre"), email = "you@example.com")
+License: Artistic-2.0
+Encoding: UTF-8
+LazyData: false
+Depends: R (>= 4.0)

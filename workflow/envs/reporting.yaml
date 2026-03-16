@@ -1,0 +1,16 @@
+name: sc_reporting
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.3
+  - r-tidyverse
+  - r-ggplot2
+  - r-plotly
+  - r-dt
+  - r-knitr
+  - r-rmarkdown
+  - r-jsonlite
+  - r-optparse
+  - pandoc

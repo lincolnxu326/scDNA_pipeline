@@ -1,0 +1,14 @@
+name: sc_qc
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.9
+  - multiqc=1.15
+  - fastqc=0.12.1
+  - samtools=1.18
+  - pandas
+  - numpy
+  - matplotlib
+  - jinja2

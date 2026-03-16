@@ -1,0 +1,25 @@
+# Snakemake runtime state
+.snakemake/
+
+# Conda caches and environments
+.conda/
+.renv/
+
+# renv local library cache
+renv/library/
+
+# Generated reports and graphs
+report.html
+rulegraph*.dot
+rulegraph*.pdf
+Rplots.pdf
+
+# Pipeline and scheduler logs
+logs/
+
+# Generated pipeline outputs
+results/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

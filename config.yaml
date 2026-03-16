@@ -1,0 +1,137 @@
+# Configuration for single-cell DNA sequencing pipeline
+
+# Project name
+project_name: "SingleCell_ScDNA"
+
+# Reference genome - REQUIRED FORMAT: chr1-22, chrX, chrY
+genome:
+  fasta: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/ref/GRCh38_canonical.fa"
+  index_prefix: "/camp/project/tracerX/working/CRENAL200/SOURCES/FlorisScDNA/hg38/GRCh38_canonical"
+  assembly: "hg38"
+  chromosomes: ["chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", 
+                 "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", 
+                 "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22"]
+
+# Mappability reference (optional - will generate if not provided)
+mappability:
+  reference_bam: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DAQI/source/Aneufinder/mappability/normal_ref_sorted.bam"  # Leave empty to generate, or provide path to existing
+
+# Processing parameters (FROM ORIGINAL SCRIPTS - DO NOT MODIFY)
+preprocessing:
+  # UMI and barcode extraction (from extract_umi_barcode.py)
+  umi_length: 12          # UMI from R2 start
+  barcode1_length: 8      # Well barcode from R1
+  barcode2_length: 8      # Well barcode from R2  
+  barcode1_offset: 0      # Position in R1
+  barcode2_offset: 12     # Position in R2 (after UMI)
+  r1_trim_5prime: 22      # Trim from R1 5' end (8bp barcode + 14bp linker)
+  r2_trim_5prime: 34      # Trim from R2 5' end (12bp UMI + 8bp barcode + 14bp linker)
+  
+  # Deduplication
+  dedup_method: "umi_insert"  # Use both UMI and insert for deduplication
+  min_read_length: 20          # Minimum length after trimming
+  
+  # Adapter filtering (from filter_adapter_dimers.py)
+  adapter_sequence: "CAGTCAGCGT"  # Adapter dimer sequence
+  case_insensitive: false
+  filter_both_reads: true          # Require adapter in both R1 and R2
+
+# Alignment parameters (from 1_Fastq2Bam.sh)
+alignment:
+  bowtie2_params: "--very-sensitive"  # From original script
+  threads: 32
+  memory: "256G"
+
+# Blacklist generation parameters
+blacklist:
+  read_length: 51               # Read length for simulated reads
+  binsize: 100000              # 100kb bins for mappability
+  lower_quantile: 0.10         # Lower cutoff for blacklist
+  upper_quantile: 0.98         # Upper cutoff for blacklist
+  
+# AneuFinder parameters (from 2_Aneufinder.R)
+aneufinder:
+  method: ["edivisive"]        # Segmentation method
+  binsize: 1000000            # 1Mb bins
+  min_mappability: 0.85       
+  variable_width_reference: null  # Set to BAM file if using variable width
+  num_cpu: 20
+  chromosomes: ["chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", 
+                "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", 
+                "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22"]
+  cluster_plots: true          # Generate cluster plots
+  reuse_existing: false
+
+# MultiQC settings
+multiqc:
+  enable: true
+  config_file: "multiqc_config.yaml"  # MultiQC configuration
+  extra_params: "--interactive --export"  # Additional MultiQC parameters
+
+# Quality control thresholds
+qc_thresholds:
+  min_reads_per_well: 10000        # Minimum reads per well
+  max_reads_per_well: 10000000     # Maximum reads per well
+  min_barcode_assignment: 70       # Minimum barcode assignment rate (%)
+  max_duplication_rate: 50         # Maximum duplication rate (%)
+  max_adapter_contamination: 10    # Maximum adapter dimer rate (%)
+  min_mapping_rate: 70             # Minimum alignment rate (%)
+
+# Resource allocation for SLURM
+resources:
+  default:
+    threads: 1
+    mem_mb: 4000
+    time: 60          # 1 hour in minutes
+    partition: "ncpu"
+  demux:
+    threads: 32
+    mem_mb: 256000
+    time: 840        # 14 hours in minutes
+    partition: "ncpu"
+    
+  dedup:
+    threads: 32
+    mem_mb: 256000
+    time: 840         # 14 hours in minutes
+    partition: "ncpu"
+    
+  filter:
+    threads: 10
+    mem_mb: 16000
+    time: 600         # 10 hours in minutes
+    partition: "ncpu"
+    
+  alignment:
+    threads: 32
+    mem_mb: 512000
+    time: 480         # 8 hours in minutes
+    partition: "ncpu"
+    
+  blacklist:
+    threads: 8
+    mem_mb: 32000
+    time: 240         # 4 hours in minutes
+    partition: "ncpu"
+    
+  aneufinder:
+    threads: 32
+    mem_mb: 512000
+    time: 1440        # 24 hours in minutes
+    partition: "ncpu"
+    
+  multiqc:
+    threads: 4
+    mem_mb: 16000
+    time: 120          # 2 hours in minutes
+    partition: "ncpu"
+
+# Batch processing
+batch_size: 1000000  # for demultiplexing (from original script)
+
+# Email notifications (set via command line with --email)
+email: "lincoln_xu@crick.ac.uk"
+
+# Pipeline behavior
+keep_intermediate: false  # Keep intermediate files (for debugging)
+on_error: "finish"       # What to do on error: 'stop' or 'finish' other samples
