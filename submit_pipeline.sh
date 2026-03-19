@@ -2,9 +2,9 @@
 #SBATCH --job-name=scDNA_pipeline_plate17_4 # EDIT THIS
 #SBATCH --output=logs/pipeline_%j.out
 #SBATCH --error=logs/pipeline_%j.err
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
 #SBATCH --partition=ncpu
-#SBATCH --mem=128G
+#SBATCH --mem=8G
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=lincoln.xu@crick.ac.uk # EDIT THIS
@@ -26,11 +26,11 @@ cd "${PIPELINE_DIR}"
 # ============================================================================
 
 # Mode to run (choose one):
-# - "blacklist"  : Generate blacklist plots only
 # - "full"       : Run complete pipeline
-# - "qc"         : Generate QC reports only
-# - "aneufinder" : Run AneuFinder only (after blacklist)
-MODE="qc"
+# - "preprocessing"  : Demux, dedup, dimer removal, align
+# - "qc"         : Generate QC reports (preprocessing + FastQC + MultiQC)
+# - "aneufinder" : Run blacklist, GC template generation, and AneuFinder
+MODE="aneufinder" # EDIT THIS
 
 # Plate directory EDIT THIS
 PLATE_DIR="/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/384_well/plate17/plate17_4"
@@ -68,8 +68,8 @@ case "${MODE}" in
     echo "Generating QC reports..."
     ;;
   aneufinder)
-    TARGET="all"
-    EXTRA_FLAGS="--forcerun run_aneufinder"
+    TARGET="all_aneufinder"
+    EXTRA_FLAGS=""
     echo "Running AneuFinder analysis..."
     ;;
   *)

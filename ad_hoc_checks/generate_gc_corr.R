@@ -5,14 +5,14 @@ library(BSgenome.Hsapiens.UCSC.hg38)
 library(GenomicRanges)
 library(Biostrings)
 
-plate_dir <- "plate7_pipe_test" #EDIT here
+plate_dir <- "plate17/plate17_1" # EDIT here
 
 VARIABLE_WIDTH_REFERENCE <- "/nemo/project/proj-tracerX/working/VCAM1_GnT/DAQI/source/Aneufinder/mappability/normal_ref_sorted.bam.bed"
-BLACKLIST <-paste0("/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/",plate_dir,"/mappability/blacklist.bed.gz")   # set to the same file you use in the real run, or leave NULL
+BLACKLIST <- "/nemo/project/proj-tracerX/working/VCAM1_GnT/TOOLS/scDNA_pipeline/resources/reference/mappability/blacklist.bed.gz"
 CHROMS <- paste0("chr", c(1:22))
+OUTPUT_RDS <- "/nemo/project/proj-tracerX/working/VCAM1_GnT/TOOLS/scDNA_pipeline/resources/reference/hg38_binsize1000000_variable_bins_with_GC.rds"
 
-dir.create(paste0("/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/",plate_dir,"/GC"),recursive = T)
-
+dir.create(dirname(OUTPUT_RDS), recursive = TRUE, showWarnings = FALSE)
 
 ref_binned_ <- binReads(
   file = VARIABLE_WIDTH_REFERENCE,
@@ -36,11 +36,10 @@ if (inherits(ref_binned_, "GRanges")) {
     idx <- which(seqnames(gr) == chr)
     views <- Biostrings::Views(BSgenome.Hsapiens.UCSC.hg38[[chr]], ranges(gr)[idx])
     freqs <- Biostrings::alphabetFrequency(views, as.prob = TRUE, baseOnly = TRUE)
-    gc_vals[idx] <- rowSums(freqs[, c("G","C"), drop = FALSE])
+    gc_vals[idx] <- rowSums(freqs[, c("G", "C"), drop = FALSE])
   }
   mcols(gr)$GC <- gc_vals
   ref_binned_ <- GenomicRanges::GRangesList("0" = gr)
-  
 } else if (inherits(ref_binned_, "GRangesList")) {
   for (i in seq_along(ref_binned_)) {
     gr <- ref_binned_[[i]]
@@ -49,14 +48,11 @@ if (inherits(ref_binned_, "GRanges")) {
       idx <- which(seqnames(gr) == chr)
       views <- Biostrings::Views(BSgenome.Hsapiens.UCSC.hg38[[chr]], ranges(gr)[idx])
       freqs <- Biostrings::alphabetFrequency(views, as.prob = TRUE, baseOnly = TRUE)
-      gc_vals[idx] <- rowSums(freqs[, c("G","C"), drop = FALSE])
+      gc_vals[idx] <- rowSums(freqs[, c("G", "C"), drop = FALSE])
     }
     mcols(gr)$GC <- gc_vals
     ref_binned_[[i]] <- gr
   }
 }
 
-saveRDS(
-  ref_binned_,
-  paste0("/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/",plate_dir,"/GC/hg38_variable_bins_with_GC.rds"),version=2
-)
+saveRDS(ref_binned_, OUTPUT_RDS, version = 2)

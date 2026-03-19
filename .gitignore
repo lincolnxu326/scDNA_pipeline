@@ -19,7 +19,13 @@ logs/
 
 # Generated pipeline outputs
 results/
+resources/
+
+# ad hoc checks: keep only source R scripts tracked here
+ad_hoc_checks/*
+!ad_hoc_checks/*.R
 
 # OS/editor noise
 .DS_Store
 Thumbs.db
+AGENT_CONTEXT.md

@@ -29,12 +29,30 @@ PIPELINE_DIR = Path(workflow.basedir).resolve()
 LOG_DIR = PLATE_DIR / "logs"
 MAPPABILITY_DIR = PLATE_DIR / "mappability"
 
-# GC template for this plate
-# Either set in config under aneufinder.gc_rds, or use the per plate default
-PLATE_GC_RDS = config.get("aneufinder", {}).get(
-    "gc_rds",
-    str(PLATE_DIR / "GC" / "hg38_variable_bins_with_GC.rds")
+RESOURCE_DIR = PIPELINE_DIR / "resources"
+REFERENCE_RESOURCE_DIR = RESOURCE_DIR / "reference"
+MAPPABILITY_RESOURCE_DIR = REFERENCE_RESOURCE_DIR / "mappability"
+
+MAPPABILITY_CONFIG = config.get("mappability", {})
+ANEUFINDER_CONFIG = config.get("aneufinder", {})
+REFERENCE_ASSEMBLY = ANEUFINDER_CONFIG.get("assembly", "hg38")
+
+VARIABLE_WIDTH_REFERENCE = ANEUFINDER_CONFIG.get("variable_width_reference") or (
+    f"{MAPPABILITY_CONFIG['reference_bam']}.bed"
 )
+
+SHARED_BLACKLIST = MAPPABILITY_CONFIG.get("blacklist") or str(
+    MAPPABILITY_RESOURCE_DIR / "blacklist.bed.gz"
+)
+
+GC_RDS = ANEUFINDER_CONFIG.get("gc_rds") or str(
+    REFERENCE_RESOURCE_DIR
+    / f"{REFERENCE_ASSEMBLY}_binsize{config['aneufinder']['binsize']}_variable_bins_with_GC.rds"
+)
+
+ANEUFINDER_CHROMS = ",".join(config["aneufinder"]["chromosomes"])
+MAPPABILITY_DIR = MAPPABILITY_RESOURCE_DIR
+PLATE_GC_RDS = GC_RDS
 
 # Load barcodes (check multiple locations)
 barcodes_file = None
@@ -69,7 +87,6 @@ rule all:
         # blacklist generated for this plate
         str(MAPPABILITY_DIR / "blacklist.bed.gz"),
         # plate specific GC template rds (must be created in relaxed env beforehand)
-        str(PLATE_GC_RDS),
         # aneufinder done
         str(PLATE_DIR / "aneufinder" / "complete.flag"),
         # multiqc done
@@ -409,6 +426,31 @@ rule generate_blacklist:
 # AneuFinder
 # ------------------------------------------------------------------------
 
+rule all_aneufinder:
+    input:
+        str(PLATE_DIR / "aneufinder" / "complete.flag")
+
+rule check_gc_rds:
+    input:
+        blacklist = str(MAPPABILITY_DIR / "blacklist.bed.gz")
+    output:
+        flag = str(PLATE_DIR / "logs" / "gc_rds_ready.flag")
+    params:
+        gc_ready = str(PLATE_DIR / "logs" / "gc_rds_ready.flag")
+    log:
+        str(PLATE_DIR / "logs" / "check_gc_rds.log")
+    shell:
+        r"""
+        mkdir -p $(dirname {output.flag})
+        if [ ! -f "{params.gc_rds}" ]; then
+            echo "Missing GC RDS: {params.gc_rds}" > {log}
+            echo "Generate it manually with ad_hoc_checks/generate_gc_corr.R after blacklist is created." >> {log}
+            exit 1
+        fi
+        echo "Found GC RDS: {params.gc_rds}" > {log}
+        touch {output.flag}
+        """
+
 rule run_aneufinder:
     """Run AneuFinder for copy number analysis (requires plate specific GC template)."""
     input:
@@ -465,6 +507,7 @@ rule multiqc:
         str(PLATE_DIR / "demux" / "demux_stats.json"),
         str(PLATE_DIR / "dedup" / "dedup_summary.tsv"),
         str(PLATE_DIR / "filtered" / "adapter_filter_summary.tsv"),
+        expand(str(PLATE_DIR / "bam" / "{well}.stats.txt"), well=WELLS),
         expand(str(PLATE_DIR / "bam" / "{well}.flagstat.txt"), well=WELLS)
     output:
         report = str(PLATE_DIR / "multiqc" / "multiqc_report.html"),
