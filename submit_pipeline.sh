@@ -16,9 +16,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Under sbatch, the script is executed from a temporary spool copy. Prefer the
-# original submission directory so paths resolve to the real pipeline checkout.
-PIPELINE_DIR="${SLURM_SUBMIT_DIR:-${SCRIPT_DIR}}"
+# Prefer the real script location when it contains the pipeline. Fall back to
+# SLURM_SUBMIT_DIR only when the script is executed from a spool copy.
+if [[ -f "${SCRIPT_DIR}/Snakefile" && -f "${SCRIPT_DIR}/config.yaml" ]]; then
+  PIPELINE_DIR="${SCRIPT_DIR}"
+else
+  PIPELINE_DIR="${SLURM_SUBMIT_DIR:-${SCRIPT_DIR}}"
+fi
 cd "${PIPELINE_DIR}"
 
 # ============================================================================

@@ -46,8 +46,10 @@ run_aneufinder <- function() {
   if (!file.exists(opt$`gc-rds`)) {
     stop(paste0("GC template file not found: ", opt$`gc-rds`))
   }
+  set.seed(42)
   
   log_info("Starting AneuFinder analysis")
+  log_info("Random seed set to 42")
   log_info(paste0("Input: ", opt$input))
   log_info(paste0("Output: ", opt$output))
   log_info(paste0("GC template: ", opt$`gc-rds`))
@@ -155,9 +157,9 @@ run_aneufinder <- function() {
       
       model <- switch(
         m,
-        "edivisive" = findCNVs.strandseq(binned_gc_obj_, ID = id_, method = "edivisive"),
-        "HMM"       = findCNVs.strandseq(binned_gc_obj_, ID = id_, method = "HMM"),
-        "dnacopy"   = findCNVs.strandseq(binned_gc_obj_, ID = id_, method = "dnacopy"),
+        "edivisive" = findCNVs(binned_gc_obj_, ID = id_, method = "edivisive"),
+        "HMM"       = findCNVs(binned_gc_obj_, ID = id_, method = "HMM"),
+        "dnacopy"   = findCNVs(binned_gc_obj_, ID = id_, method = "dnacopy"),
         stop(paste("Unknown method:", m))
       )
       save(model, file = file.path(method_dir_, paste0(id_, ".RData")))
@@ -172,6 +174,23 @@ run_aneufinder <- function() {
       
       rdata_files <- list.files(method_dir, pattern = "\\.RData$", full.names = TRUE)
       if (length(rdata_files) == 0) next
+
+      profiles_pdf <- file.path(opt$output, paste0("profiles_", m, ".pdf"))
+      grDevices::pdf(file = profiles_pdf, width = 12, height = 14)
+      for (ifile in rdata_files) {
+        tryCatch({
+          obj_name <- load(ifile)
+          model <- get(obj_name[1])
+          p1 <- plot(model, type = "profile", plot.breakpoints = TRUE)
+          p2 <- plot(model, type = "histogram")
+          cowplt <- cowplot::plot_grid(p1, p2, ncol = 1, rel_heights = c(1.4, 1))
+          print(cowplt)
+        }, error = function(err) {
+          log_warn(paste0("Could not create profile plot for ", basename(ifile), ": ", err$message))
+        })
+      }
+      grDevices::dev.off()
+      log_info(paste0("Profile plots written to: ", profiles_pdf))
       
       clus <- clusterByQuality(rdata_files)
       out_pdf <- file.path(opt$output, paste0("Genome_heatmap_cluster_1Mb_bins_", m, ".pdf"))
