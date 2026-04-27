@@ -176,7 +176,7 @@ run_aneufinder <- function() {
       if (length(rdata_files) == 0) next
 
       profiles_pdf <- file.path(opt$output, paste0("profiles_", m, ".pdf"))
-      grDevices::pdf(file = profiles_pdf, width = 12, height = 14)
+      grDevices::pdf(file = profiles_pdf, width = 20, height = 10)
       for (ifile in rdata_files) {
         tryCatch({
           obj_name <- load(ifile)

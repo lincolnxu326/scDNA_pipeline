@@ -10,12 +10,15 @@ intro_text: |
 report_comment: |
   Generated using the scDNA sequencing pipeline. For issues, check the log files.
 
-# File search patterns
 sp:
   fastqc:
     fn: "*_fastqc.zip"
-  samtools:
-    fn_re: ".*(stats|flagstat)\\.txt$"
+  samtools/stats:
+    fn: "*.stats.txt"
+    contents: "SN	raw total sequences:"
+  samtools/flagstat:
+    fn: "*.flagstat.txt"
+    contents: "in total (QC-passed reads + QC-failed reads)"
   bowtie2:
     fn: "*.log"
     contents: "reads; of these:"
@@ -27,7 +30,6 @@ sp:
     adapter:
       fn: "adapter_filter_summary.tsv"
 
-# Custom data parsing
 custom_data:
   demux_stats:
     id: 'demux_stats'
@@ -37,7 +39,7 @@ custom_data:
     pconfig:
       title: 'Demultiplexed Reads per Well'
       ylab: 'Number of Reads'
-      
+
   dedup_stats:
     id: 'dedup_stats'
     section_name: 'Deduplication Statistics'
@@ -55,7 +57,7 @@ custom_data:
         title: 'Unique Reads'
         description: 'Number of unique reads after deduplication'
         format: '{:,.0f}'
-        
+
   adapter_stats:
     id: 'adapter_stats'
     section_name: 'Adapter Filtering'
@@ -70,14 +72,12 @@ custom_data:
         kept: '#5cb85c'
         removed: '#d9534f'
 
-# Module order
 module_order:
   - fastqc
-  - custom_data
   - samtools
   - bowtie2
+  - custom_data
 
-# Exclude patterns (files to ignore)
 fn_ignore_files:
   - "*.bam"
   - "*.bai"
@@ -88,16 +88,51 @@ fn_ignore_dirs:
   - "*/logs/*"
   - "*/benchmarks/*"
 
-# Sample name cleaning
-fn_clean_sample_names:
-  - regex: '_R[12]\.filtered'
-    repl: ''
-  - regex: '\.dedup'
-    repl: ''
-  - regex: '_fastqc'
-    repl: ''
+table_sample_merge:
+  R1:
+    - type: regex
+      pattern: '_R1$'
+  R2:
+    - type: regex
+      pattern: '_R2$'
 
-# Report sections to show
+extra_fn_clean_exts:
+  - type: remove
+    pattern: '.filtered'
+    module: fastqc
+  - type: remove
+    pattern: '_fastqc'
+    module: fastqc
+  - type: regex_keep
+    pattern: 'W\d+'
+    module: bowtie2
+
+general_stats_columns:
+  samtools/flagstat:
+    mapped_passed:
+      title: 'Mapped Reads'
+      hidden: false
+    mapped_passed_pct:
+      title: 'Mapped %'
+      hidden: false
+    total_passed:
+      title: 'Total Reads'
+      hidden: false
+    properly_paired_passed:
+      title: 'Properly Paired'
+      hidden: false
+  samtools/stats:
+    raw_total_sequences:
+      title: 'Raw Total Sequences'
+      hidden: false
+    reads_mapped:
+      title: 'Reads Mapped'
+      hidden: false
+  bowtie2:
+    overall_alignment_rate:
+      title: 'Alignment Rate'
+      hidden: false
+
 report_section_order:
   demux_stats:
     order: 100
@@ -112,25 +147,6 @@ report_section_order:
   bowtie2:
     order: 600
 
-# Table columns to show
-table_columns_visible:
-  FastQC:
-    percent_duplicates: True
-    percent_gc: True
-    avg_sequence_length: True
-    total_sequences: True
-    percent_fails: True
-  Samtools Stats:
-    mapped_passed: True
-    properly_paired_passed: True
-    pairs_on_different_chromosomes_passed: True
-    raw_total_sequences: True
-  Bowtie2:
-    overall_alignment_rate: True
-    aligned_exactly_1_time: True
-    aligned_gt_1_time: True
-
-# Thresholds for highlighting
 table_cond_formatting_rules:
   high_duplication:
     description: 'Highlight high duplication rates'
@@ -153,31 +169,19 @@ table_cond_formatting_rules:
     max: 100
     scale: 'RdYlGn-rev'
 
-
-# Export settings
 export_plots: true
 plots_force_flat: false
 plots_force_interactive: false
 data_dir_name: 'multiqc_data'
 
-# Decimalpoint format
 decimalPoint_format: ','
 thousandsSep_format: ' '
 
-# Pipeline metadata
 report_header_info:
   - Pipeline: 'scDNA-seq Analysis'
   - Version: '2.0'
   - Contact: 'Single-Cell Genomics Core'
   - Reference: 'GRCh38'
 
-# Custom logo (optional)
-# custom_logo: 'path/to/logo.png'
-# custom_logo_url: 'https://www.example.com'
-# custom_logo_title: 'Organization Name'
-
-# Max table rows to show
 max_table_rows: 500
-
-# Log file parsing
-log_filesize_limit: 10000000  # 10MB
+log_filesize_limit: 10000000
