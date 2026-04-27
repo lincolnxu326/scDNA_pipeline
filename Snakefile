@@ -54,14 +54,17 @@ ANEUFINDER_CHROMS = ",".join(config["aneufinder"]["chromosomes"])
 MAPPABILITY_DIR = MAPPABILITY_RESOURCE_DIR
 PLATE_GC_RDS = GC_RDS
 
-# Load barcodes (check multiple locations)
-barcodes_file = None
-if (PIPELINE_DIR / "barcodes.tsv").exists():
-    barcodes_file = PIPELINE_DIR / "barcodes.tsv"
-elif (PLATE_DIR / "barcodes.tsv").exists():
-    barcodes_file = PLATE_DIR / "barcodes.tsv"
-else:
-    raise FileNotFoundError("No barcodes.tsv found")
+# Load barcodes (prefer shared resources, then fall back to the plate directory)
+barcode_candidates = [
+    RESOURCE_DIR / "barcodes.tsv",
+    RESOURCE_DIR / "barcodes" / "barcodes.tsv",
+    PLATE_DIR / "barcodes.tsv",
+]
+
+barcodes_file = next((path for path in barcode_candidates if path.exists()), None)
+if barcodes_file is None:
+    searched = ", ".join(str(path) for path in barcode_candidates)
+    raise FileNotFoundError(f"No barcodes.tsv found. Checked: {searched}")
 
 barcodes_df = pd.read_csv(barcodes_file, sep="\t", comment="#")
 WELLS = barcodes_df["well_id"].tolist()

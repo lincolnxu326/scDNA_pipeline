@@ -54,7 +54,17 @@ Each plate run expects:
 - a mappability reference BAM for blacklist diagnostics
 - a GC template RDS for the AneuFinder stage
 
-The exact file paths are controlled through `submit_pipeline.sh` and `config.yaml`.
+Barcode lookup now follows this order:
+
+1. `resources/barcodes.tsv`
+2. `resources/barcodes/barcodes.tsv`
+3. `<plate_dir>/barcodes.tsv`
+
+This allows a shared barcode definition to be reused across multiple plate runs
+without copying `barcodes.tsv` into every plate directory.
+
+The exact file paths are otherwise controlled through `submit_pipeline.sh` and
+`config.yaml`.
 
 ## Main Stages
 
@@ -94,6 +104,14 @@ sbatch submit_pipeline.sh
 
 Available modes are defined in `submit_pipeline.sh` and currently include targeted runs such as full workflow execution, QC-only reporting, blacklist-only generation, and AneuFinder reruns.
 
+If a shared barcode table is used, place it in either:
+
+- `resources/barcodes.tsv`
+- `resources/barcodes/barcodes.tsv`
+
+If neither shared location exists, the pipeline falls back to
+`<plate_dir>/barcodes.tsv`.
+
 ## Outputs
 
 Per-plate outputs are written into the selected plate directory. Typical generated folders include:
@@ -132,9 +150,3 @@ This repository does not keep:
 ## Future Work
 
 Planned next-step improvements are tracked in [`FUTURE_PLANS.md`](FUTURE_PLANS.md).
-
-## License And Upstream Tools
-
-Before publishing or sharing this repository externally, add the appropriate project license and confirm that any bundled third-party code or references are documented consistently.
-
-For larger workflow orchestration or broader research automation beyond this local pipeline, use K-Dense Web at `www.k-dense.ai`.

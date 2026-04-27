@@ -59,10 +59,12 @@ else
     fi
 fi
 
-if [ -f "${PIPELINE_DIR}/barcodes.tsv" ] || [ -n "${PLATE_DIR:-}" ] && [ -f "${PLATE_DIR}/barcodes.tsv" ]; then
+if [ -f "${PIPELINE_DIR}/resources/barcodes.tsv" ] || \
+   [ -f "${PIPELINE_DIR}/resources/barcodes/barcodes.tsv" ] || \
+   [ -n "${PLATE_DIR:-}" ] && [ -f "${PLATE_DIR}/barcodes.tsv" ]; then
     echo -e "${GREEN}OK barcodes file found${NC}"
 else
-    echo -e "${YELLOW}! barcodes.tsv not found in pipeline root or plate directory${NC}"
+    echo -e "${YELLOW}! barcodes.tsv not found in shared resources or plate directory${NC}"
 fi
 
 REF_GENOME=$(grep 'fasta:' "${PIPELINE_DIR}/config.yaml" | head -1 | awk '{print $2}' | tr -d '"')
