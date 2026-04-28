@@ -163,51 +163,16 @@ rule demultiplex:
             --log {log} 2>&1
         """
 
-rule deduplicate:
-    input:
-        str(PLATE_DIR / "demux" / "demux_stats.json")
-    output:
-        summary = str(PLATE_DIR / "dedup" / "dedup_summary.tsv"),
-        stats = str(PLATE_DIR / "dedup" / "dedup_stats.json"),
-        fastqs = expand(str(PLATE_DIR / "dedup" / "{well}_R{read}.dedup.fastq.gz"),
-                        well=WELLS, read=[1, 2])
-    params:
-        indir = str(PLATE_DIR / "demux"),
-        outdir = str(PLATE_DIR / "dedup"),
-        script = str(PIPELINE_DIR / "workflow" / "scripts" / "preprocessing" / "dedup.py"),
-        method = config["preprocessing"]["dedup_method"],
-        min_length = config["preprocessing"]["min_read_length"]
-    log:
-        str(LOG_DIR / f"dedup_{PLATE}.log")
-    threads: config["resources"]["dedup"]["threads"]
-    resources:
-        mem_mb = config["resources"]["dedup"]["mem_mb"],
-        runtime = config["resources"]["dedup"]["time"],
-        partition = config["resources"]["dedup"]["partition"]
-    conda:
-        "workflow/envs/preprocessing.yaml"
-    shell:
-        """
-        mkdir -p {PLATE_DIR}/dedup
-        python {params.script} \
-            --indir {params.indir} \
-            --outdir {params.outdir} \
-            --method {params.method} \
-            --min-length {params.min_length} \
-            --stats {output.stats} \
-            --log {log} 2>&1
-        """
-
 rule filter_dimers:
     input:
-        str(PLATE_DIR / "dedup" / "dedup_summary.tsv")
+        str(PLATE_DIR / "demux" / "demux_stats.json")
     output:
         summary = str(PLATE_DIR / "filtered" / "adapter_filter_summary.tsv"),
         stats = str(PLATE_DIR / "filtered" / "filter_stats.json"),
         fastqs = expand(str(PLATE_DIR / "filtered" / "{well}_R{read}.filtered.fastq.gz"),
                         well=WELLS, read=[1, 2])
     params:
-        indir = str(PLATE_DIR / "dedup"),
+        indir = str(PLATE_DIR / "demux"),
         outdir = str(PLATE_DIR / "filtered"),
         script = str(PIPELINE_DIR / "workflow" / "scripts" / "preprocessing" / "filter_adapter_dimers.py"),
         adapter = config["preprocessing"]["adapter_sequence"],
@@ -231,7 +196,7 @@ rule filter_dimers:
             --adapter {params.adapter} \
             {params.case_insensitive} \
             {params.both_reads} \
-            --suffix .dedup.fastq.gz \
+            --suffix .fastq.gz \
             --out-suffix .filtered.fastq.gz \
             --stats {output.stats} \
             --log {log} 2>&1
@@ -305,10 +270,10 @@ rule align:
         r1 = str(PLATE_DIR / "filtered" / "{well}_R1.filtered.fastq.gz"),
         r2 = str(PLATE_DIR / "filtered" / "{well}_R2.filtered.fastq.gz")
     output:
-        bam = str(PLATE_DIR / "bam" / "{well}.bam"),
-        bai = str(PLATE_DIR / "bam" / "{well}.bam.bai"),
-        stats = str(PLATE_DIR / "bam" / "{well}.stats.txt"),
-        flagstat = str(PLATE_DIR / "bam" / "{well}.flagstat.txt")
+        bam = str(PLATE_DIR / "raw_bam" / "{well}.bam"),
+        bai = str(PLATE_DIR / "raw_bam" / "{well}.bam.bai"),
+        stats = str(PLATE_DIR / "raw_bam" / "{well}.stats.txt"),
+        flagstat = str(PLATE_DIR / "raw_bam" / "{well}.flagstat.txt")
     params:
         index_prefix = config["genome"]["index_prefix"],
         bowtie2_params = config["alignment"]["bowtie2_params"],
@@ -325,7 +290,7 @@ rule align:
         "workflow/envs/alignment.yaml"
     shell:
         """
-        mkdir -p {PLATE_DIR}/bam {LOG_DIR}/align
+        mkdir -p {PLATE_DIR}/raw_bam {LOG_DIR}/align
         (bowtie2 -x {params.index_prefix} \
             -1 {input.r1} -2 {input.r2} \
             --threads {threads} {params.bowtie2_params} \
@@ -338,6 +303,80 @@ rule align:
         samtools index {output.bam}
         samtools stats {output.bam} > {output.stats}
         samtools flagstat {output.bam} > {output.flagstat}
+        """
+
+rule deduplicate_bam:
+    input:
+        bam = str(PLATE_DIR / "raw_bam" / "{well}.bam"),
+        bai = str(PLATE_DIR / "raw_bam" / "{well}.bam.bai")
+    output:
+        bam = str(PLATE_DIR / "bam" / "{well}.bam"),
+        bai = str(PLATE_DIR / "bam" / "{well}.bam.bai"),
+        stats = str(PLATE_DIR / "bam" / "{well}.stats.txt"),
+        flagstat = str(PLATE_DIR / "bam" / "{well}.flagstat.txt")
+    params:
+        method = config["preprocessing"]["umi_tools_method"],
+        tmpdir = str(PLATE_DIR / "dedup" / "tmp" / "{well}")
+    log:
+        str(LOG_DIR / "dedup" / f"{PLATE}_{{well}}.log")
+    threads: config["resources"]["dedup"]["threads"]
+    resources:
+        mem_mb = config["resources"]["dedup"]["mem_mb"],
+        runtime = config["resources"]["dedup"]["time"],
+        partition = config["resources"]["dedup"]["partition"]
+    conda:
+        "workflow/envs/alignment.yaml"
+    shell:
+        """
+        mkdir -p {PLATE_DIR}/bam {params.tmpdir} {LOG_DIR}/dedup
+        umi_tools dedup \
+            --stdin {input.bam} \
+            --stdout {output.bam} \
+            --paired \
+            --extract-umi-method=read_id \
+            --umi-separator "_" \
+            --method {params.method} \
+            --temp-dir {params.tmpdir} \
+            --log={log}
+        samtools index {output.bam}
+        samtools stats {output.bam} > {output.stats}
+        samtools flagstat {output.bam} > {output.flagstat}
+        """
+
+rule summarize_dedup:
+    input:
+        raw_bams = expand(str(PLATE_DIR / "raw_bam" / "{well}.bam"), well=WELLS),
+        dedup_bams = expand(str(PLATE_DIR / "bam" / "{well}.bam"), well=WELLS)
+    output:
+        summary = str(PLATE_DIR / "dedup" / "dedup_summary.tsv"),
+        stats = str(PLATE_DIR / "dedup" / "dedup_stats.json")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "preprocessing" / "summarize_umi_tools_dedup.py"),
+        raw_dir = str(PLATE_DIR / "raw_bam"),
+        dedup_dir = str(PLATE_DIR / "bam"),
+        outdir = str(PLATE_DIR / "dedup"),
+        method = config["preprocessing"]["umi_tools_method"],
+        wells = " ".join(WELLS)
+    log:
+        str(LOG_DIR / f"dedup_summary_{PLATE}.log")
+    threads: 1
+    resources:
+        mem_mb = 4000,
+        runtime = 30,
+        partition = config["resources"]["default"]["partition"]
+    conda:
+        "workflow/envs/alignment.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir} {LOG_DIR}
+        python {params.script} \
+            --raw-dir {params.raw_dir} \
+            --dedup-dir {params.dedup_dir} \
+            --outdir {params.outdir} \
+            --method {params.method} \
+            --stats {output.stats} \
+            --log {log} \
+            --wells {params.wells}
         """
 
 
@@ -553,6 +592,7 @@ rule clean:
         rm -rf {PLATE_DIR}/dedup
         rm -rf {PLATE_DIR}/filtered
         rm -rf {PLATE_DIR}/fastqc
+        rm -rf {PLATE_DIR}/raw_bam
         rm -rf {PLATE_DIR}/bam
         rm -rf {PLATE_DIR}/aneufinder
         rm -rf {PLATE_DIR}/multiqc

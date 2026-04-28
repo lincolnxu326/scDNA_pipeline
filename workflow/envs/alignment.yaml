@@ -6,4 +6,5 @@ channels:
 dependencies:
   - bowtie2=2.5.1
   - samtools=1.18
+  - umi_tools
   - python=3.9

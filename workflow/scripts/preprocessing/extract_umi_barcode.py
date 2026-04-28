@@ -173,9 +173,9 @@ def process_reads(args, logger):
             r2_seq_trimmed = r2_seq[args.r2_trim:].rstrip()
             r2_qual_trimmed = r2_qual[args.r2_trim:].rstrip()
             
-            # Create annotated header
+            # Put UMI at the end of the read name for umi-tools dedup
             read_id = r1_header.split()[0]
-            new_header = f"{read_id}|UMI:{umi}|BC1:{bc1}|BC2:{bc2}\n"
+            new_header = f"{read_id}_{umi} BC1:{bc1} BC2:{bc2}\n"
             
             # Determine well assignment
             if bc1 in barcode_map:

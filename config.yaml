@@ -28,7 +28,7 @@ preprocessing:
   r2_trim_5prime: 34      # Trim from R2 5' end (12bp UMI + 8bp barcode + 14bp linker)
   
   # Deduplication
-  dedup_method: "umi_insert"  # Use both UMI and insert for deduplication
+  umi_tools_method: "directional"  # Error-aware UMI grouping for umi_tools dedup
   min_read_length: 20          # Minimum length after trimming
   
   # Adapter filtering (from filter_adapter_dimers.py)

@@ -39,7 +39,7 @@ The current preprocessing path is slower than it should be, especially in demult
 Planned direction:
 
 - optimize demultiplexing, which is currently dominated by single-process Python and gzip I/O
-- split deduplication into per-well jobs so Snakemake can parallelize it cleanly
+- review UMI-tools deduplication metrics after test plate runs
 - split adapter filtering into per-well jobs for the same reason
 - review alignment resource mapping so allocated SLURM CPUs match requested tool threads
 - add benchmarking and controlled performance knobs only after the current pipeline behavior is stable

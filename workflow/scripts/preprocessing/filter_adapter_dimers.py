@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Filter out adapter dimer reads from deduplicated FASTQ files.
+Filter out adapter dimer reads from paired FASTQ files.
 Aligned for single-cell sequencing pipeline.
 """
 
@@ -32,10 +32,10 @@ def setup_logging(log_file: str = None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Filter adapter dimer reads from deduplicated FASTQs."
+        description="Filter adapter dimer reads from paired FASTQs."
     )
     parser.add_argument('--indir', required=True,
-                       help="Input directory with deduplicated FASTQs")
+                       help="Input directory with paired FASTQs")
     parser.add_argument('--outdir', required=True,
                        help="Output directory for filtered FASTQs")
     parser.add_argument('--adapter', default='CAGTCAGCGT',
@@ -44,8 +44,8 @@ def parse_args():
                        help="Case-insensitive adapter matching")
     parser.add_argument('--both-reads', action='store_true', default=True,
                        help="Require adapter in both R1 and R2 (default: True)")
-    parser.add_argument('--suffix', default='.dedup.fastq.gz',
-                       help="Input file suffix (default: .dedup.fastq.gz)")
+    parser.add_argument('--suffix', default='.fastq.gz',
+                       help="Input file suffix (default: .fastq.gz)")
     parser.add_argument('--out-suffix', default='.filtered.fastq.gz',
                        help="Output file suffix (default: .filtered.fastq.gz)")
     parser.add_argument('--log', help="Log file path")

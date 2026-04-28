@@ -1,6 +1,6 @@
 # scDNA Pipeline
 
-Snakemake workflow for processing Strand-seq or single-cell DNA sequencing plates from paired FASTQ input through demultiplexing, deduplication, adapter filtering, FastQC, alignment, blacklist diagnostics, and AneuFinder CNV calling.
+Snakemake workflow for processing Strand-seq or single-cell DNA sequencing plates from paired FASTQ input through demultiplexing, adapter filtering, FastQC, alignment, UMI-tools deduplication, blacklist diagnostics, and AneuFinder CNV calling.
 
 This repository is the pipeline codebase only. Plate-specific data, intermediate files, and runtime logs are produced outside version control.
 
@@ -9,10 +9,10 @@ This repository is the pipeline codebase only. Plate-specific data, intermediate
 The active workflow currently supports:
 
 - plate-level FASTQ demultiplexing into well FASTQs
-- UMI-aware deduplication
 - adapter dimer filtering
 - FastQC and MultiQC reporting
 - per-well alignment with Bowtie2 and Samtools
+- UMI-aware BAM deduplication with UMI-tools
 - blacklist diagnostics from a reference mappability BAM
 - AneuFinder-based CNV calling
 
@@ -69,10 +69,10 @@ The exact file paths are otherwise controlled through `submit_pipeline.sh` and
 ## Main Stages
 
 1. Demultiplex plate FASTQs into per-well FASTQs.
-2. Deduplicate reads using UMI-aware preprocessing.
-3. Remove adapter dimer reads.
-4. Run FastQC and aggregate with MultiQC.
-5. Align per-well reads with Bowtie2 and Samtools.
+2. Remove adapter dimer reads.
+3. Run FastQC and aggregate with MultiQC.
+4. Align per-well reads with Bowtie2 and Samtools.
+5. Deduplicate aligned BAMs with UMI-tools.
 6. Generate blacklist diagnostics from the configured mappability reference.
 7. Run AneuFinder for CNV calling.
 
@@ -120,6 +120,7 @@ Per-plate outputs are written into the selected plate directory. Typical generat
 - `dedup/`
 - `filtered/`
 - `fastqc/`
+- `raw_bam/`
 - `bam/`
 - `mappability/`
 - `aneufinder/`
