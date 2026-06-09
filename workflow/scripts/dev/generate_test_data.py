@@ -188,7 +188,7 @@ preprocessing:
   barcode2_offset: {args.umi_length}
   r1_trim_5prime: 22
   r2_trim_5prime: 34
-  dedup_method: "umi_insert"
+  umi_tools_method: "directional"
   adapter_sequence: "CAGTCAGCGT"
   case_insensitive: false
 
