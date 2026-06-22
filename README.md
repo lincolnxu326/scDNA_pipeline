@@ -74,7 +74,117 @@ The exact file paths are otherwise controlled through `submit_pipeline.sh` and
 4. Align per-well reads with Bowtie2 and Samtools.
 5. Deduplicate aligned BAMs with UMI-tools.
 6. Generate blacklist diagnostics from the configured mappability reference.
-7. Run AneuFinder for CNV calling.
+7. Run the **first** AneuFinder pass for CNV calling on all wells.
+8. Build a static HTML QC review report for manual well decisions.
+9. Run the **second** AneuFinder pass on the wells marked PASS, then build the
+   final copy-number review viewer.
+
+## Two-Pass AneuFinder Workflow
+
+CNV calling runs in two passes with a human review step in between:
+
+```
+preprocessing → aneufinder (first pass) → review → [edit CSV] → validate
+              → aneufinder_reviewed (second pass) → cn_review
+```
+
+**Why two passes.** The first pass runs AneuFinder on every well so a reviewer can
+look at all profiles and decide which wells to keep. The second pass reruns
+AneuFinder on **only the PASS wells** to produce the final copy-number outputs.
+The two are kept in separate directories so the first-pass outputs the review was
+based on are never overwritten, and the original BAMs are never modified (the
+second pass reads them through a symlink-only input directory).
+
+### Step 1 — first pass + review report
+
+Run the pipeline up to and including the first-pass review report (this is the
+former "full" mode; it stops for human review):
+
+```bash
+# submit_pipeline.sh: MODE="pre_review"   (or target `all`)
+sbatch submit_pipeline.sh
+```
+
+This produces the self-contained, fully static report:
+
+```
+<PLATE_DIR>/qc_review/review.html
+```
+
+It needs no server and opens over Samba or as a local `file://` document — every
+well's two AneuFinder plots (a **copy-number profile** and a **bin read-count
+histogram**) plus metadata are embedded. Use it to:
+
+1. Click a well to load its metadata, **profile**, and **histogram**, alongside its
+   automatic read-count status.
+2. Set a **decision** with the PASS / EXCLUDE / REVIEW / REPEAT buttons, pick any
+   number of **reason** chips, add **notes**, and click **Save decision**. The cell
+   recolours by decision and a dot marks wells you've saved.
+3. Click **Copy terminal save command** and paste it into a terminal on the cluster
+   — it writes your decisions straight to `<PLATE_DIR>/qc_decisions.csv` (per-plate,
+   in the data directory). The browser cannot write into the project, so this command
+   (a `cat > … <<'EOF'` heredoc) — or **Download qc_decisions.csv** placed at that path
+   — is how the file gets saved.
+
+### Step 2 — one post-review run
+
+After the CSV is saved, a single mode runs everything downstream:
+
+```bash
+# submit_pipeline.sh: MODE="post_review"   (or target `post_review`)
+sbatch submit_pipeline.sh
+```
+
+`post_review` validates the decisions, derives the PASS wells, runs the second
+AneuFinder pass, renders the reviewed CN plots + genome heatmap, and builds the
+final viewer. Outputs:
+
+```
+<PLATE_DIR>/aneufinder_reviewed/      # second-pass models + profiles (PASS wells)
+<PLATE_DIR>/qc_review/cn_review.html  # final read-only CN viewer (profiles + genome heatmap)
+```
+
+So the normal operator sequence is just two runs:
+
+1. `MODE=pre_review` → review HTML, then stop
+2. save `<PLATE_DIR>/qc_decisions.csv` (use the report's **Copy terminal save command**)
+3. `MODE=post_review` → final `cn_review.html`
+
+**Debug / step-by-step modes.** `post_review` is the convenience target; the same
+chain is also exposed as individual modes for partial reruns or debugging:
+`validate_review` → `aneufinder_reviewed` → `cn_review` (see `submit_pipeline.sh`).
+
+Only `PASS` wells are included by default; set `qc_review.include_review: true` in
+`config.yaml` to also include `REVIEW` wells. `EXCLUDE` and `REPEAT` are excluded
+(`REPEAT` wells are logged as "flagged for rerun").
+
+`<PLATE_DIR>/qc_decisions.csv` is the reproducible human artefact (per plate, in the
+data directory; path configurable via `qc_review.decisions_file`), and is the only
+input the second pass gates on — a missing CSV never blocks the pre-review stages. All
+profile and histogram PNGs (both passes) and the genome heatmap are rendered
+read-only in R from the AneuFinder `.RData` models; the page order of
+`profiles_*.pdf` is never used. See [`config/README.md`](config/README.md) for the
+CSV schema and decision semantics, and `submit_pipeline.sh` for the full list of modes.
+
+### Automatic gating (read-count only)
+
+Each well's decision is pre-filled from an automatic status based **only on read
+count**: `usable_reads` = mapped reads in the dedup BAM (`reads mapped` from
+`bam/{well}.stats.txt`). Cutoffs are in `config.yaml → qc_review`:
+
+| usable_reads | auto_status | default decision |
+|--------------|-------------|------------------|
+| `>= usable_reads_pass_cutoff` (100000) | PASS | PASS |
+| `>= usable_reads_warn_cutoff` (50000), `<` pass | WARN | REVIEW |
+| `< usable_reads_warn_cutoff` | FAIL | EXCLUDE |
+| missing | UNKNOWN | REVIEW |
+
+So wells are pre-sorted (not all `REVIEW`); the human decision always wins.
+**Duplication is not used for gating** — the panel shows it only as a clearly
+labelled diagnostic (**UMI-tools duplicate rate** from `dedup/dedup_summary.tsv`,
+i.e. umi_tools `duplicate_reads/total`, plus **UMI dedup retention**), distinct from
+FastQC/MultiQC duplication. Multiple review reasons are stored `;`-separated in the
+single `reason` CSV column.
 
 ## Environments
 
@@ -124,7 +234,9 @@ Per-plate outputs are written into the selected plate directory. Typical generat
 - `bam/`
 - `mappability/`
 - `aneufinder/`
+- `aneufinder_reviewed/`
 - `multiqc/`
+- `qc_review/`
 - `logs/`
 
 These generated outputs are intentionally excluded from version control.
