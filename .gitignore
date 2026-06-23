@@ -21,6 +21,11 @@ logs/
 results/
 resources/
 
+# Human QC decisions now live per-plate at <PLATE_DIR>/qc_decisions.csv (in the data
+# directory, outside this repo). config/ keeps only the template + schema docs.
+# Ignore a stray copy if one is ever dropped here by mistake.
+config/qc_decisions.csv
+
 # ad hoc checks: keep only source R scripts tracked here
 ad_hoc_checks/*
 !ad_hoc_checks/*.R

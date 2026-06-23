@@ -44,7 +44,24 @@ Planned direction:
 - review alignment resource mapping so allocated SLURM CPUs match requested tool threads
 - add benchmarking and controlled performance knobs only after the current pipeline behavior is stable
 
-## 4. Principles For Future Changes
+## 4. Downstream Gating From QC Decisions (IMPLEMENTED)
+
+Implemented as the **two-pass AneuFinder workflow**: the first pass (`aneufinder/`)
+feeds `qc_review/review.html`; a validated `<PLATE_DIR>/qc_decisions.csv` is turned into
+`qc_review/included_wells.tsv` and the second pass (`aneufinder_reviewed/`) reruns
+AneuFinder on the PASS wells only, with a final `qc_review/cn_review.html` viewer.
+First-pass outputs and original BAMs are never mutated. See `README.md` (Two-Pass
+AneuFinder Workflow) and `AGENT_CONTEXT.md`.
+
+Remaining parked ideas in this area:
+
+- **REPEAT auto-rerun loop:** wells marked `REPEAT` are currently excluded and only
+  logged; a future loop could re-sequence / reprocess them and re-review.
+- **Multi-round review:** support more than two passes (review → reprocess → review)
+  with versioned decision files.
+- **Cohort assembly:** combine PASS wells across plates into a cohort-level CN matrix.
+
+## 5. Principles For Future Changes
 
 When these future upgrades are implemented:
 

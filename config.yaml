@@ -61,12 +61,27 @@ aneufinder:
                 "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22"]
   cluster_plots: true          # Generate cluster plots
   reuse_existing: false
+  reviewed_dir: "aneufinder_reviewed"  # output dir for the post-review (second) pass
 
 # MultiQC settings
 multiqc:
   enable: true
   config_file: "multiqc_config.yaml"  # MultiQC configuration
   extra_params: "--interactive --export"  # Additional MultiQC parameters
+
+# QC review report (static HTML human-review layer, after MultiQC + AneuFinder)
+qc_review:
+  method: "edivisive"                       # AneuFinder method whose profiles to render
+  decisions_file: "qc_decisions.csv"        # human decisions artefact, RELATIVE TO THE PLATE DIR (validated on demand)
+  include_review: false                      # also include REVIEW wells in the second pass (default: PASS only)
+  # Read-count-only automatic gating. usable_reads = mapped reads in the dedup BAM
+  # (reads mapped from bam/{well}.stats.txt). Duplication is NOT used for gating.
+  #   usable_reads >= pass_cutoff               -> auto_status PASS  (default decision PASS)
+  #   warn_cutoff <= usable_reads < pass_cutoff -> auto_status WARN  (default decision REVIEW)
+  #   usable_reads < warn_cutoff                -> auto_status FAIL  (default decision EXCLUDE)
+  #   usable_reads missing                      -> auto_status UNKNOWN (default decision REVIEW)
+  usable_reads_pass_cutoff: 100000
+  usable_reads_warn_cutoff: 50000
 
 # Quality control thresholds
 qc_thresholds:
@@ -119,11 +134,23 @@ resources:
     mem_mb: 512000
     time: 1440        # 24 hours in minutes
     partition: "ncpu"
+
+  aneufinder_reviewed:    # post-review second pass (fewer wells, so lighter)
+    threads: 16
+    mem_mb: 256000
+    time: 720         # 12 hours in minutes
+    partition: "ncpu"
     
   multiqc:
     threads: 4
     mem_mb: 16000
     time: 120          # 2 hours in minutes
+    partition: "ncpu"
+
+  qc_review:
+    threads: 4
+    mem_mb: 16000
+    time: 120          # 2 hours in minutes (per-well profile rendering)
     partition: "ncpu"
 
 # Batch processing

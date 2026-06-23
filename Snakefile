@@ -70,6 +70,23 @@ barcodes_df = pd.read_csv(barcodes_file, sep="\t", comment="#")
 WELLS = barcodes_df["well_id"].tolist()
 print(f"Using {len(WELLS)} well barcodes from {barcodes_file}")
 
+# QC review sub-stage (static HTML human-review report; runs after multiqc + aneufinder)
+REVIEW_CONFIG = config.get("qc_review", {})
+REVIEW_DIR = PLATE_DIR / "qc_review"
+REVIEW_METHOD = REVIEW_CONFIG.get("method") or config["aneufinder"]["method"][0]
+# Human decisions live WITH the plate data (per-plate), not in the shared pipeline dir.
+# `decisions_file` is resolved relative to PLATE_DIR unless given as an absolute path.
+_decisions_cfg = REVIEW_CONFIG.get("decisions_file") or "qc_decisions.csv"
+DECISIONS_FILE = _decisions_cfg if Path(_decisions_cfg).is_absolute() else str(PLATE_DIR / _decisions_cfg)
+
+# Two-pass AneuFinder: the post-review (second) pass reruns only PASS wells into a
+# separate directory so the first-pass outputs the review was based on stay intact.
+REVIEWED_DIR = PLATE_DIR / (ANEUFINDER_CONFIG.get("reviewed_dir") or "aneufinder_reviewed")
+REVIEWED_PLOTS_DIR = REVIEW_DIR / "reviewed" / "plots"
+REVIEWED_HEATMAP = REVIEW_DIR / "reviewed" / "genome_heatmap.png"
+INCLUDED_WELLS_TSV = REVIEW_DIR / "included_wells.tsv"
+INCLUDE_REVIEW_FLAG = "--include-review" if REVIEW_CONFIG.get("include_review") else ""
+
 # ========================================================================
 # Helper Functions
 # ========================================================================
@@ -93,7 +110,9 @@ rule all:
         # aneufinder done
         str(PLATE_DIR / "aneufinder" / "complete.flag"),
         # multiqc done
-        str(PLATE_DIR / "multiqc" / "multiqc_report.html")
+        str(PLATE_DIR / "multiqc" / "multiqc_report.html"),
+        # static human QC review report (after multiqc + aneufinder)
+        str(REVIEW_DIR / "review.html")
 
 rule all_preprocessing:
     """Run up to alignment."""
@@ -110,6 +129,36 @@ rule all_qc:
     """Generate QC reports only."""
     input:
         str(PLATE_DIR / "multiqc" / "multiqc_report.html")
+
+rule qc_review_report:
+    """Build the static human QC review report (after multiqc + aneufinder)."""
+    input:
+        str(REVIEW_DIR / "review.html")
+
+rule all_aneufinder_first:
+    """First-pass AneuFinder (alias of the existing run; symmetric MODE naming)."""
+    input:
+        str(PLATE_DIR / "aneufinder" / "complete.flag")
+
+rule all_aneufinder_reviewed:
+    """Second (post-review) AneuFinder pass on PASS wells only."""
+    input:
+        str(REVIEWED_DIR / "complete.flag")
+
+rule cn_review_report:
+    """Final copy-number review viewer over the second AneuFinder pass."""
+    input:
+        str(REVIEW_DIR / "cn_review.html")
+
+rule post_review:
+    """All post-review steps in one target (the normal MODE=post_review entry point).
+
+    Reuses the existing chain: validate_qc_decisions -> derive_included_wells ->
+    run_aneufinder_reviewed -> render_reviewed_profiles -> cn_review. Requires the
+    human-saved <PLATE_DIR>/qc_decisions.csv; no pre-review target depends on it.
+    """
+    input:
+        str(REVIEW_DIR / "cn_review.html")
 
 # ------------------------------------------------------------------------
 # Preprocessing Rules
@@ -579,6 +628,289 @@ rule multiqc:
             2>&1 | tee {log}
         """
 
+# ------------------------------------------------------------------------
+# QC Review (static HTML, after MultiQC + AneuFinder)
+# ------------------------------------------------------------------------
+
+rule render_well_profiles:
+    """Render one AneuFinder copy-number profile PNG per well from existing .RData models.
+
+    Read-only consumer of run_aneufinder.R output (does not modify it). Runs via
+    renv (no conda:), exactly like run_aneufinder / generate_blacklist.
+    """
+    input:
+        flag = str(PLATE_DIR / "aneufinder" / "complete.flag")
+    output:
+        manifest = str(REVIEW_DIR / "plots" / "manifest.json")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "render_well_profiles.R"),
+        models_dir = str(PLATE_DIR / "aneufinder" / "MODELS"),
+        outdir = str(REVIEW_DIR / "plots"),
+        method = REVIEW_METHOD
+    log:
+        str(LOG_DIR / f"qc_review_plots_{PLATE}.log")
+    threads: 4
+    resources:
+        mem_mb = config.get("resources", {}).get("qc_review", {}).get("mem_mb", 16000),
+        runtime = config.get("resources", {}).get("qc_review", {}).get("time", 120),
+        partition = config["resources"]["default"]["partition"]
+    shell:
+        """
+        mkdir -p {params.outdir} {LOG_DIR}
+        Rscript {params.script} \
+            --input {params.models_dir} \
+            --outdir {params.outdir} \
+            --method {params.method} \
+            2>&1 | tee {log}
+        """
+
+rule qc_review:
+    """Build the static HTML QC review report (metadata + per-well plots embedded)."""
+    input:
+        multiqc = str(PLATE_DIR / "multiqc" / "multiqc_report.html"),
+        multiqc_data = str(PLATE_DIR / "multiqc" / "multiqc_data"),
+        manifest = str(REVIEW_DIR / "plots" / "manifest.json"),
+        bam_stats = expand(str(PLATE_DIR / "bam" / "{well}.stats.txt"), well=WELLS)
+    output:
+        html = str(REVIEW_DIR / "review.html")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "generate_qc_review.py"),
+        plate = PLATE,
+        plate_dir = str(PLATE_DIR),
+        plots_dir = str(REVIEW_DIR / "plots"),
+        config_file = str(PIPELINE_DIR / "config.yaml"),
+        outdir = str(REVIEW_DIR),
+        multiqc_data = str(PLATE_DIR / "multiqc" / "multiqc_data"),
+        decisions_path = DECISIONS_FILE,
+        wells = " ".join(WELLS)
+    log:
+        str(LOG_DIR / f"qc_review_{PLATE}.log")
+    threads: 1
+    resources:
+        mem_mb = 8000,
+        runtime = 30,
+        partition = config["resources"]["default"]["partition"]
+    conda:
+        "workflow/envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir} {LOG_DIR}
+        python {params.script} \
+            --plate {params.plate} \
+            --plate-dir {params.plate_dir} \
+            --multiqc-data {params.multiqc_data} \
+            --plots-dir {params.plots_dir} \
+            --config {params.config_file} \
+            --outdir {params.outdir} \
+            --decisions-path {params.decisions_path} \
+            --wells {params.wells} \
+            2>&1 | tee {log}
+        """
+
+rule validate_qc_decisions:
+    """Validate the human-edited <PLATE_DIR>/qc_decisions.csv (run on demand, not part of `all`)."""
+    input:
+        decisions = DECISIONS_FILE
+    output:
+        flag = str(REVIEW_DIR / "qc_decisions.validated.flag")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "validate_qc_decisions.py"),
+        wells = " ".join(WELLS)
+    log:
+        str(LOG_DIR / f"qc_decisions_validate_{PLATE}.log")
+    threads: 1
+    resources:
+        mem_mb = 2000,
+        runtime = 10,
+        partition = config["resources"]["default"]["partition"]
+    conda:
+        "workflow/envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {REVIEW_DIR} {LOG_DIR}
+        python {params.script} \
+            --decisions {input.decisions} \
+            --wells {params.wells} \
+            --out-flag {output.flag} \
+            2>&1 | tee {log}
+        """
+
+# ------------------------------------------------------------------------
+# Two-pass AneuFinder: post-review (second) pass on PASS wells only
+# ------------------------------------------------------------------------
+
+rule derive_included_wells:
+    """Derive the PASS (+ optional REVIEW) wells from a validated decisions CSV."""
+    input:
+        flag = str(REVIEW_DIR / "qc_decisions.validated.flag"),   # ensures validation ran
+        decisions = DECISIONS_FILE
+    output:
+        included = str(INCLUDED_WELLS_TSV)
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "derive_included_wells.py"),
+        include_review = INCLUDE_REVIEW_FLAG
+    log:
+        str(LOG_DIR / f"derive_included_wells_{PLATE}.log")
+    threads: 1
+    resources:
+        mem_mb = 2000,
+        runtime = 10,
+        partition = config["resources"]["default"]["partition"]
+    conda:
+        "workflow/envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {REVIEW_DIR} {LOG_DIR}
+        python {params.script} \
+            --decisions {input.decisions} {params.include_review} \
+            --out {output.included} \
+            2>&1 | tee {log}
+        """
+
+rule run_aneufinder_reviewed:
+    """Second AneuFinder pass on PASS wells only.
+
+    Reuses run_aneufinder.R UNCHANGED by pointing --input at a directory of symlinks
+    to the included wells' BAMs and --output at a separate aneufinder_reviewed/ dir.
+    Original BAMs and the first-pass aneufinder/ outputs are never touched.
+    """
+    input:
+        included = str(INCLUDED_WELLS_TSV),
+        bams = expand(str(PLATE_DIR / "bam" / "{well}.bam"), well=WELLS),
+        blacklist = str(MAPPABILITY_DIR / "blacklist.bed.gz"),
+        gc_rds = str(PLATE_GC_RDS)
+    output:
+        flag = str(REVIEWED_DIR / "complete.flag")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "analysis" / "run_aneufinder.R"),
+        bam_dir = str(PLATE_DIR / "bam"),
+        link_dir = str(REVIEWED_DIR / "input_bams"),
+        outdir = str(REVIEWED_DIR),
+        blacklist = str(MAPPABILITY_DIR / "blacklist.bed.gz"),
+        gc_rds = str(PLATE_GC_RDS),
+        method = ",".join(config["aneufinder"]["method"]),
+        binsize = config["aneufinder"]["binsize"],
+        chromosomes = ",".join(config["aneufinder"]["chromosomes"]),
+        num_cpu = config["aneufinder"]["num_cpu"],
+        cluster_plots = "TRUE" if config["aneufinder"]["cluster_plots"] else "FALSE"
+    log:
+        str(LOG_DIR / f"aneufinder_reviewed_{PLATE}.log")
+    threads: config["resources"].get("aneufinder_reviewed", config["resources"]["aneufinder"])["threads"]
+    resources:
+        mem_mb = config["resources"].get("aneufinder_reviewed", config["resources"]["aneufinder"])["mem_mb"],
+        runtime = config["resources"].get("aneufinder_reviewed", config["resources"]["aneufinder"])["time"],
+        partition = config["resources"].get("aneufinder_reviewed", config["resources"]["aneufinder"])["partition"]
+    shell:
+        r"""
+        mkdir -p {params.link_dir} {params.outdir} {LOG_DIR}
+        # Symlink-only input set for PASS wells; never copy or mutate the originals.
+        find {params.link_dir} -maxdepth 1 -type l -name '*.bam' -delete 2>/dev/null || true
+        find {params.link_dir} -maxdepth 1 -type l -name '*.bam.bai' -delete 2>/dev/null || true
+        n=0
+        while IFS=$'\t' read -r sample well; do
+            [ "$well" = "well" ] && continue
+            [ -z "$well" ] && continue
+            if [ -f "{params.bam_dir}/$well.bam" ]; then
+                ln -sf "{params.bam_dir}/$well.bam" "{params.link_dir}/$well.bam"
+                [ -f "{params.bam_dir}/$well.bam.bai" ] && \
+                    ln -sf "{params.bam_dir}/$well.bam.bai" "{params.link_dir}/$well.bam.bai"
+                n=$((n+1))
+            fi
+        done < {input.included}
+        echo "Second-pass AneuFinder on $n PASS well(s)" | tee {log}
+        if [ "$n" -eq 0 ]; then
+            echo "ERROR: no PASS wells in {input.included}; nothing to run for the second pass." | tee -a {log}
+            exit 1
+        fi
+        Rscript {params.script} \
+            --input {params.link_dir} \
+            --output {params.outdir} \
+            --blacklist {params.blacklist} \
+            --gc-rds {params.gc_rds} \
+            --method {params.method} \
+            --binsize {params.binsize} \
+            --chromosomes {params.chromosomes} \
+            --numcpu {params.num_cpu} \
+            --cluster-plots {params.cluster_plots} \
+            --reuse-existing FALSE \
+            2>&1 | tee -a {log}
+        touch {output.flag}
+        """
+
+rule render_reviewed_profiles:
+    """Render second-pass per-well PNGs + a genome-wide CN heatmap for the CN viewer."""
+    input:
+        flag = str(REVIEWED_DIR / "complete.flag")
+    output:
+        manifest = str(REVIEWED_PLOTS_DIR / "manifest.json"),
+        heatmap = str(REVIEWED_HEATMAP)
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "render_well_profiles.R"),
+        models_dir = str(REVIEWED_DIR / "MODELS"),
+        outdir = str(REVIEWED_PLOTS_DIR),
+        method = REVIEW_METHOD
+    log:
+        str(LOG_DIR / f"cn_review_plots_{PLATE}.log")
+    threads: 4
+    resources:
+        mem_mb = config.get("resources", {}).get("qc_review", {}).get("mem_mb", 16000),
+        runtime = config.get("resources", {}).get("qc_review", {}).get("time", 120),
+        partition = config["resources"]["default"]["partition"]
+    shell:
+        """
+        mkdir -p {params.outdir} {LOG_DIR}
+        Rscript {params.script} \
+            --input {params.models_dir} \
+            --outdir {params.outdir} \
+            --method {params.method} \
+            --heatmap {output.heatmap} \
+            2>&1 | tee {log}
+        """
+
+rule cn_review:
+    """Build the final copy-number review viewer (read-only) over the second pass."""
+    input:
+        manifest = str(REVIEWED_PLOTS_DIR / "manifest.json"),
+        heatmap = str(REVIEWED_HEATMAP),
+        included = str(INCLUDED_WELLS_TSV),
+        multiqc = str(PLATE_DIR / "multiqc" / "multiqc_report.html")
+    output:
+        html = str(REVIEW_DIR / "cn_review.html")
+    params:
+        script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "generate_qc_review.py"),
+        plate = PLATE,
+        plate_dir = str(PLATE_DIR),
+        plots_dir = str(REVIEWED_PLOTS_DIR),
+        config_file = str(PIPELINE_DIR / "config.yaml"),
+        outdir = str(REVIEW_DIR),
+        multiqc_data = str(PLATE_DIR / "multiqc" / "multiqc_data"),
+        wells = " ".join(WELLS)
+    log:
+        str(LOG_DIR / f"cn_review_{PLATE}.log")
+    threads: 1
+    resources:
+        mem_mb = 8000,
+        runtime = 30,
+        partition = config["resources"]["default"]["partition"]
+    conda:
+        "workflow/envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir} {LOG_DIR}
+        python {params.script} \
+            --report-kind cn \
+            --plate {params.plate} \
+            --plate-dir {params.plate_dir} \
+            --multiqc-data {params.multiqc_data} \
+            --plots-dir {params.plots_dir} \
+            --included-wells {input.included} \
+            --heatmap {input.heatmap} \
+            --config {params.config_file} \
+            --outdir {params.outdir} \
+            --wells {params.wells} \
+            2>&1 | tee {log}
+        """
+
 # ========================================================================
 # Utilities
 # ========================================================================
@@ -595,7 +927,9 @@ rule clean:
         rm -rf {PLATE_DIR}/raw_bam
         rm -rf {PLATE_DIR}/bam
         rm -rf {PLATE_DIR}/aneufinder
+        rm -rf {REVIEWED_DIR}
         rm -rf {PLATE_DIR}/multiqc
+        rm -rf {PLATE_DIR}/qc_review
         rm -rf {PLATE_DIR}/mappability
         rm -rf {PLATE_DIR}/logs
         """

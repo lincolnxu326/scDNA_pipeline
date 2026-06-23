@@ -1,0 +1,5 @@
+sample_id,well,decision,reason,notes
+plate17_4_W01,W01,PASS,,
+plate17_4_W02,W02,EXCLUDE,low_read_count;noisy_profile,Weak CN signal
+plate17_4_W03,W03,REVIEW,poor_bin_distribution,
+plate17_4_W04,W04,REPEAT,suspected_doublet_or_mixed_well,resequence
