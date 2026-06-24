@@ -71,7 +71,7 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")  # unix EOL (no trailing \r)
         w.writerow(["sample_id", "well"])
         for sample_id, well in included:
             w.writerow([sample_id, well])

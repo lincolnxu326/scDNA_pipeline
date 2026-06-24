@@ -82,8 +82,10 @@ DECISIONS_FILE = _decisions_cfg if Path(_decisions_cfg).is_absolute() else str(P
 # Two-pass AneuFinder: the post-review (second) pass reruns only PASS wells into a
 # separate directory so the first-pass outputs the review was based on stay intact.
 REVIEWED_DIR = PLATE_DIR / (ANEUFINDER_CONFIG.get("reviewed_dir") or "aneufinder_reviewed")
-REVIEWED_PLOTS_DIR = REVIEW_DIR / "reviewed" / "plots"
-REVIEWED_HEATMAP = REVIEW_DIR / "reviewed" / "genome_heatmap.png"
+# Final CN deliverable lives in its own clearly-named folder (the last step).
+CN_REVIEW_DIR = PLATE_DIR / "CN_review"
+REVIEWED_PLOTS_DIR = CN_REVIEW_DIR / "plots"
+REVIEWED_HEATMAP = CN_REVIEW_DIR / "genome_heatmap.png"
 INCLUDED_WELLS_TSV = REVIEW_DIR / "included_wells.tsv"
 INCLUDE_REVIEW_FLAG = "--include-review" if REVIEW_CONFIG.get("include_review") else ""
 
@@ -148,7 +150,7 @@ rule all_aneufinder_reviewed:
 rule cn_review_report:
     """Final copy-number review viewer over the second AneuFinder pass."""
     input:
-        str(REVIEW_DIR / "cn_review.html")
+        str(CN_REVIEW_DIR / "cn_review.html")
 
 rule post_review:
     """All post-review steps in one target (the normal MODE=post_review entry point).
@@ -158,7 +160,7 @@ rule post_review:
     human-saved <PLATE_DIR>/qc_decisions.csv; no pre-review target depends on it.
     """
     input:
-        str(REVIEW_DIR / "cn_review.html")
+        str(CN_REVIEW_DIR / "cn_review.html")
 
 # ------------------------------------------------------------------------
 # Preprocessing Rules
@@ -661,6 +663,7 @@ rule render_well_profiles:
             --input {params.models_dir} \
             --outdir {params.outdir} \
             --method {params.method} \
+            --format png \
             2>&1 | tee {log}
         """
 
@@ -808,6 +811,7 @@ rule run_aneufinder_reviewed:
         find {params.link_dir} -maxdepth 1 -type l -name '*.bam.bai' -delete 2>/dev/null || true
         n=0
         while IFS=$'\t' read -r sample well; do
+            well="${{well%$'\r'}}"   # tolerate CRLF (e.g. CSV saved on Windows/Excel)
             [ "$well" = "well" ] && continue
             [ -z "$well" ] && continue
             if [ -f "{params.bam_dir}/$well.bam" ]; then
@@ -863,6 +867,7 @@ rule render_reviewed_profiles:
             --input {params.models_dir} \
             --outdir {params.outdir} \
             --method {params.method} \
+            --format svg \
             --heatmap {output.heatmap} \
             2>&1 | tee {log}
         """
@@ -875,14 +880,14 @@ rule cn_review:
         included = str(INCLUDED_WELLS_TSV),
         multiqc = str(PLATE_DIR / "multiqc" / "multiqc_report.html")
     output:
-        html = str(REVIEW_DIR / "cn_review.html")
+        html = str(CN_REVIEW_DIR / "cn_review.html")
     params:
         script = str(PIPELINE_DIR / "workflow" / "scripts" / "reporting" / "generate_qc_review.py"),
         plate = PLATE,
         plate_dir = str(PLATE_DIR),
         plots_dir = str(REVIEWED_PLOTS_DIR),
         config_file = str(PIPELINE_DIR / "config.yaml"),
-        outdir = str(REVIEW_DIR),
+        outdir = str(CN_REVIEW_DIR),
         multiqc_data = str(PLATE_DIR / "multiqc" / "multiqc_data"),
         wells = " ".join(WELLS)
     log:
@@ -930,6 +935,7 @@ rule clean:
         rm -rf {REVIEWED_DIR}
         rm -rf {PLATE_DIR}/multiqc
         rm -rf {PLATE_DIR}/qc_review
+        rm -rf {PLATE_DIR}/CN_review
         rm -rf {PLATE_DIR}/mappability
         rm -rf {PLATE_DIR}/logs
         """

@@ -140,15 +140,21 @@ AneuFinder pass, renders the reviewed CN plots + genome heatmap, and builds the
 final viewer. Outputs:
 
 ```
-<PLATE_DIR>/aneufinder_reviewed/      # second-pass models + profiles (PASS wells)
-<PLATE_DIR>/qc_review/cn_review.html  # final read-only CN viewer (profiles + genome heatmap)
+<PLATE_DIR>/aneufinder_reviewed/      # second-pass models (PASS wells)
+<PLATE_DIR>/CN_review/                 # FINAL deliverable: cn_review.html + plots/ + genome_heatmap.png
 ```
 
-So the normal operator sequence is just two runs:
+The `CN_review/` folder is the clearly-named final step. The `cn_review.html` viewer
+shows the **whole plate**: wells kept for the second pass are coloured by their original
+automated QC status and carry their final CN profile + histogram; wells excluded at
+review are greyed out. The final `cn_review.html` renders per-well plots as **SVG**
+(crisp/responsive vector); the larger 96-well first-pass `review.html` uses **PNG** (kept
+compact). Both are shown full-width so the genome x-axis is readable. So the normal
+operator sequence is just two runs:
 
 1. `MODE=pre_review` → review HTML, then stop
 2. save `<PLATE_DIR>/qc_decisions.csv` (use the report's **Copy terminal save command**)
-3. `MODE=post_review` → final `cn_review.html`
+3. `MODE=post_review` → final `CN_review/cn_review.html`
 
 **Debug / step-by-step modes.** `post_review` is the convenience target; the same
 chain is also exposed as individual modes for partial reruns or debugging:
@@ -237,6 +243,7 @@ Per-plate outputs are written into the selected plate directory. Typical generat
 - `aneufinder_reviewed/`
 - `multiqc/`
 - `qc_review/`
+- `CN_review/`
 - `logs/`
 
 These generated outputs are intentionally excluded from version control.

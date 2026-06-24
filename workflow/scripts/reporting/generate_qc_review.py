@@ -242,6 +242,22 @@ def embed_png(path: Path) -> str:
     return f"data:image/png;base64,{data}"
 
 
+def embed_well_plot(plots_dir: Path, well: str, suffix: str) -> str:
+    """Embed {well}_{suffix} as a data URI, preferring SVG (vector, responsive) then PNG.
+
+    Also falls back to the legacy {well}.png (profile only)."""
+    svg = plots_dir / f"{well}_{suffix}.svg"
+    if svg.exists():
+        data = base64.b64encode(svg.read_bytes()).decode("ascii")
+        return f"data:image/svg+xml;base64,{data}"
+    png = plots_dir / f"{well}_{suffix}.png"
+    if png.exists():
+        return embed_png(png)
+    if suffix == "profile":
+        return embed_png(plots_dir / f"{well}.png")
+    return ""
+
+
 def build_html(app: dict) -> str:
     data_blob = json.dumps(app, separators=(",", ":"))
     return HTML_TEMPLATE.replace("__DATA_BLOB__", data_blob)
@@ -264,16 +280,18 @@ def main():
     warn_cutoff = review_cfg.get("usable_reads_warn_cutoff", DEFAULT_WARN_CUTOFF)
 
     kind = args.report_kind
-    wells = args.wells
+    wells = args.wells          # always the FULL plate (cn viewer greys out excluded wells)
+    included_set = set()
     if kind == "cn":
         included = load_included_wells(args.included_wells)
         if args.included_wells and not included:
-            logger.warning("No included wells found in %s; CN report will be empty",
+            logger.warning("No included wells found in %s; CN report will mark all as excluded",
                            args.included_wells)
         included_set = set(included)
-        # preserve the canonical WELLS ordering, restricted to the included set
-        wells = [w for w in args.wells if w in included_set] if included else []
-    logger.info("Building %s report for plate %s (%d wells)", kind, args.plate, len(wells))
+        # The cn viewer shows the WHOLE plate: included (PASS) wells keep their original
+        # auto-status colour and carry second-pass plots; excluded wells are greyed out.
+    logger.info("Building %s report for plate %s (%d wells, %d included)",
+                kind, args.plate, len(wells), len(included_set) if kind == "cn" else len(wells))
 
     # ---- aggregate per-well metrics ----------------------------------------
     dedup = load_tsv_by_well(
@@ -319,9 +337,10 @@ def main():
             usable_reads, pass_cutoff, warn_cutoff)
         status_counts[auto_status] = status_counts.get(auto_status, 0) + 1
 
-        # profile PNG: prefer {well}_profile.png, fall back to {well}.png
-        profile_uri = embed_png(plots_dir / f"{w}_profile.png") or embed_png(plots_dir / f"{w}.png")
-        hist_uri = embed_png(plots_dir / f"{w}_histogram.png")
+        # plots (prefer SVG → PNG). In cn-mode only included wells have second-pass plots.
+        is_included = (kind != "cn") or (w in included_set)
+        profile_uri = embed_well_plot(plots_dir, w, "profile") if is_included else ""
+        hist_uri = embed_well_plot(plots_dir, w, "histogram") if is_included else ""
         if profile_uri:
             n_profiles += 1
         if hist_uri:
@@ -337,6 +356,7 @@ def main():
             "default_decision": default_decision,
             "default_reason": default_reason,
             "flags": flags,
+            "included": is_included,
             "plot": profile_uri,
             "histogram": hist_uri,
         }
@@ -445,10 +465,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   textarea { font:inherit; padding:6px 8px; border:1px solid #bbb; border-radius:4px; width:100%; min-height:42px; }
   .savebtn { font:inherit; font-weight:600; padding:8px 18px; border:1px solid #2e7d32; background:#2e7d32;
              color:#fff; border-radius:5px; cursor:pointer; margin-top:10px; }
-  .plots { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
-  .plotbox { flex:1 1 460px; min-width:320px; border:1px solid #eee; border-radius:4px; background:#fafafa; }
+  .plots { display:flex; flex-direction:column; gap:14px; margin-top:12px; }
+  .plotbox { width:100%; border:1px solid #eee; border-radius:4px; background:#fafafa; }
   .plotbox .cap { font-size:12px; color:#666; padding:4px 8px; border-bottom:1px solid #eee; }
-  .plotbox img { width:100%; display:block; }
+  .plotbox img { width:100%; height:auto; display:block; }
+  .cell.excl { opacity:0.5; }
   .noplot { padding:20px; text-align:center; color:#999; font-style:italic; }
   .toolbar { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px 14px; margin:0 16px 16px; }
   .toolbar button { font:inherit; padding:7px 14px; margin-right:10px; border:1px solid #1565c0;
@@ -457,6 +478,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .toolbar code { background:#eef; padding:1px 5px; border-radius:3px; }
   .hint { font-size:12px; color:#555; margin-top:8px; line-height:1.5; }
   .progress { font-size:12px; color:#444; margin-left:auto; }
+  .mapwrap { display:flex; gap:16px; align-items:flex-start; }
+  .statcol { display:flex; flex-direction:column; gap:12px; }
+  .statcard { border:1px solid #ddd; border-radius:8px; padding:12px 18px; min-width:150px;
+              text-align:center; background:#fafafa; }
+  .statcard .lbl { font-size:12px; color:#666; text-transform:uppercase; letter-spacing:.5px; }
+  .statcard .pct { font-size:34px; font-weight:800; line-height:1.05; margin-top:6px; }
+  .statcard .cnt { font-size:13px; color:#555; margin-top:2px; }
+  .statcard.pass .pct { color:#2e7d32; }
+  .statcard.review .pct { color:#1565c0; }
 </style>
 </head>
 <body>
@@ -476,15 +506,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="layout">
   <div class="left panel">
-    <div id="plateMap"></div>
-    <div class="legend">
+    <div class="mapwrap">
+      <div id="plateMap"></div>
+      <div class="statcol" id="statcol">
+        <div class="statcard pass">
+          <div class="lbl">Pass rate</div>
+          <div class="pct"><span id="passPct">0</span>%</div>
+          <div class="cnt"><span id="passCount">0</span> / <span id="passTotal">0</span> wells</div>
+        </div>
+        <div class="statcard review">
+          <div class="lbl">Review rate</div>
+          <div class="pct"><span id="revPct">0</span>%</div>
+          <div class="cnt"><span id="revCount">0</span> / <span id="revTotal">0</span> wells</div>
+        </div>
+      </div>
+    </div>
+    <div class="legend" id="legend">
       <span><span class="swatch" style="background:#2e7d32"></span>PASS</span>
       <span><span class="swatch" style="background:#c62828"></span>EXCLUDE</span>
       <span><span class="swatch" style="background:#1565c0"></span>REVIEW</span>
       <span><span class="swatch" style="background:#ef6c00"></span>REPEAT</span>
       <span><span class="dot"></span>manually saved</span>
     </div>
-    <div class="hint">Cell colour = current decision (auto-default until you Save). The detail
+    <div class="hint" id="mapHint">Cell colour = current decision (auto-default until you Save). The detail
       panel shows the automated read-count status. A dot marks wells you have saved.</div>
   </div>
 
@@ -501,7 +545,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="hint">
     <b>Recommended:</b> click <b>Copy terminal save command</b>, then paste it into a terminal
     on the cluster &mdash; it writes your decisions straight to
-    <code id="decPath"></code>.<br>
+    <code id="decPath"></code>.
+    <b>⚠ This overwrites any existing file at that path</b> (the command prints a warning if one exists).<br>
     Then run <code>MODE=post_review</code> (validate &rarr; second-pass AneuFinder &rarr; cn_review.html).
     The browser cannot write into the project; the command (or the downloaded file) is how the CSV gets saved.
   </div>
@@ -563,7 +608,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     var cell = document.getElementById("cell-" + w);
     if (!cell) return;
     if (APP.kind === 'cn') {
-      cell.style.background = ST_COLOR[APP.wells[w].status] || "#9e9e9e";
+      var dd = APP.wells[w];
+      // included (PASS) wells keep their original auto-status colour; excluded -> grey
+      cell.style.background = dd.included ? (ST_COLOR[dd.status] || "#9e9e9e") : "#d6d6d6";
+      if (dd.included) cell.classList.remove("excl"); else cell.classList.add("excl");
       return;
     }
     var dec = decisions[w];
@@ -635,10 +683,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       html += '<button type="button" class="savebtn" id="btnSave">Save decision</button>';
     }
 
-    // plots: profile + histogram
+    // plots: profile (full width) then histogram
     html += '<div class="plots">';
-    html += plotBox("Copy-number profile", d.plot, d.well, "profile");
-    html += plotBox("Bin read-count histogram", d.histogram, d.well, "histogram");
+    if (APP.kind === 'cn' && !d.included) {
+      html += '<div class="plotbox"><div class="noplot">Excluded at review &mdash; not included in the second AneuFinder pass.</div></div>';
+    } else {
+      html += plotBox("Copy-number profile", d.plot, d.well, "profile");
+      html += plotBox("Bin read-count histogram", d.histogram, d.well, "histogram");
+    }
     html += '</div>';
 
     document.getElementById("detail").innerHTML = html;
@@ -702,6 +754,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById("progress").textContent =
       "PASS " + counts.PASS + " / EXCLUDE " + counts.EXCLUDE +
       " / REVIEW " + counts.REVIEW + " / REPEAT " + counts.REPEAT + "  •  saved " + saved;
+    var _tot = APP.wells_order.length;
+    var _set = function (id, v) { var e = document.getElementById(id); if (e) e.textContent = v; };
+    var _pct = function (n) { return _tot ? (n / _tot * 100).toFixed(1) : "0"; };
+    _set("passPct", _pct(counts.PASS)); _set("passCount", counts.PASS); _set("passTotal", _tot);
+    _set("revPct", _pct(counts.REVIEW)); _set("revCount", counts.REVIEW); _set("revTotal", _tot);
   }
 
   function flash(msg) {
@@ -729,10 +786,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   if (APP.kind === 'review') {
     updateProgress();
   } else {
-    var tb = document.getElementById("toolbar");
-    if (tb) tb.style.display = "none";
-    var lh = document.querySelector(".left .hint");
-    if (lh) lh.textContent = "Cell colour = automated QC status. Showing PASS wells from the second AneuFinder pass.";
+    // cn viewer: read-only. Hide the decisions toolbar + the pass/review cards, and
+    // swap the legend to the status scheme used to colour the kept wells.
+    var tb = document.getElementById("toolbar"); if (tb) tb.style.display = "none";
+    var sc = document.getElementById("statcol"); if (sc) sc.style.display = "none";
+    var lg = document.getElementById("legend");
+    if (lg) lg.innerHTML =
+      '<span><span class="swatch" style="background:#2e7d32"></span>PASS</span>' +
+      '<span><span class="swatch" style="background:#f9a825"></span>WARN</span>' +
+      '<span><span class="swatch" style="background:#c62828"></span>FAIL</span>' +
+      '<span><span class="swatch" style="background:#9e9e9e"></span>UNKNOWN</span>' +
+      '<span><span class="swatch" style="background:#d6d6d6"></span>excluded (not in 2nd pass)</span>';
+    var mh = document.getElementById("mapHint");
+    if (mh) mh.textContent = "Cell colour = original automated QC status of the wells kept for the " +
+      "second pass; excluded wells are greyed out. Click a well to see its final CN profile + histogram.";
   }
 
   if (APP.wells_order.length) {
@@ -746,8 +813,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   function buildSaveCommand() {
     var path = APP.decisions_path || "qc_decisions.csv";
     var dir = APP.decisions_dir || ".";
-    return "mkdir -p '" + dir + "' && cat > '" + path + "' <<'QC_DECISIONS_EOF'\n" +
-           buildCSV() + "QC_DECISIONS_EOF\n";
+    // Overwrite (cat > ...) — writes the full CSV fresh each time. Warn first if the
+    // file already exists so an existing decisions file is not clobbered silently.
+    return "mkdir -p '" + dir + "'\n" +
+           "[ -e '" + path + "' ] && echo 'WARNING: overwriting existing " + path + "'\n" +
+           "cat > '" + path + "' <<'QC_DECISIONS_EOF'\n" +
+           buildCSV() + "QC_DECISIONS_EOF\n" +
+           "echo 'Wrote " + path + "'\n";
   }
 
   function copyText(text, okMsg) {

@@ -35,7 +35,8 @@ AneuFinder profile + read-count histogram + automated read-count status).
    sbatch submit_pipeline.sh          # MODE="post_review"
    ```
    This validates the CSV, derives the PASS wells, runs the second AneuFinder pass,
-   and builds `<PLATE_DIR>/qc_review/cn_review.html`. (The individual steps are also
+   and builds the final deliverable `<PLATE_DIR>/CN_review/cn_review.html`. (The
+   individual steps are also
    available as `MODE=validate_review`, `aneufinder_reviewed`, `cn_review` for
    debugging.)
 

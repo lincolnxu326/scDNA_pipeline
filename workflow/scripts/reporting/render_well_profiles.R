@@ -26,6 +26,8 @@ option_list <- list(
               help = "Segmentation method subdirectory to render [default %default]"),
   make_option(c("--heatmap"), type = "character", default = NULL,
               help = "Optional path; if set, also render a genome-wide CN heatmap PNG"),
+  make_option(c("--format"), type = "character", default = "png",
+              help = "Per-well plot format: 'png' (compact) or 'svg' (crisp/vector) [default %default]"),
   make_option(c("--width"), type = "integer", default = 1400,
               help = "PNG width in pixels [default %default]"),
   make_option(c("--height"), type = "integer", default = 430,
@@ -75,8 +77,9 @@ render_genome_heatmap <- function(rdata_files, path) {
     return(invisible(FALSE))
   }
   ok <- tryCatch({
-    grDevices::png(filename = path, width = 1600,
-                   height = max(400, 40 * length(rdata_files)), res = 110)
+    # very wide so per-chromosome columns + labels are legible across the genome
+    grDevices::png(filename = path, width = 3000,
+                   height = max(420, 42 * length(rdata_files)), res = 110)
     print(hp)
     grDevices::dev.off()
     TRUE
@@ -107,63 +110,82 @@ render_well_profiles <- function() {
   }
   log_info(paste0("Rendering ", length(rdata_files), " profile plots from ", method_dir))
 
-  # Render one plot of the given AneuFinder type to a PNG; returns TRUE on success.
-  render_plot <- function(model, type, path, breakpoints = FALSE) {
-    out <- tryCatch({
-      p <- if (breakpoints) {
-        plot(model, type = type, plot.breakpoints = TRUE)
-      } else {
-        plot(model, type = type)
-      }
-      grDevices::png(filename = path, width = opt$width,
-                     height = opt$height, res = opt$res)
-      print(p)
-      grDevices::dev.off()
-      TRUE
-    }, error = function(err) {
-      try(grDevices::dev.off(), silent = TRUE)  # don't leak a half-open device
-      log_warn(paste0("Could not render ", type, " for ",
-                      tools::file_path_sans_ext(basename(path)), ": ", err$message))
-      FALSE
-    })
-    out
+  # Render an AneuFinder plot of the given type, wide aspect for a readable genome
+  # x-axis. format="svg" → vector (crisp/responsive; large files — good for the small
+  # cn_review). format="png" → raster (compact; good for the 96-well first-pass review).
+  # SVG always falls back to PNG if no SVG device is available. Returns basename or NA.
+  PNG_DPI <- 150L   # wide, crisp raster
+  render_vec <- function(model, type, base_noext, w_in, h_in, breakpoints = FALSE,
+                         format = "png") {
+    p <- tryCatch(
+      if (breakpoints) plot(model, type = type, plot.breakpoints = TRUE)
+      else plot(model, type = type),
+      error = function(err) {
+        log_warn(paste0("plot(", type, ") failed for ", basename(base_noext),
+                        ": ", err$message)); NULL
+      })
+    if (is.null(p)) return(NA_character_)
+    render_png <- function() {
+      png_path <- paste0(base_noext, ".png")
+      ok <- tryCatch({
+        grDevices::png(filename = png_path, width = round(w_in * PNG_DPI),
+                       height = round(h_in * PNG_DPI), res = PNG_DPI)
+        print(p); grDevices::dev.off(); TRUE
+      }, error = function(err) {
+        try(grDevices::dev.off(), silent = TRUE)
+        log_warn(paste0("Could not render ", type, " for ", basename(base_noext),
+                        ": ", err$message)); FALSE
+      })
+      if (ok) basename(png_path) else NA_character_
+    }
+    if (format == "svg") {
+      svg_path <- paste0(base_noext, ".svg")
+      ok_svg <- tryCatch({
+        if (requireNamespace("svglite", quietly = TRUE)) {
+          svglite::svglite(filename = svg_path, width = w_in, height = h_in)
+        } else {
+          grDevices::svg(filename = svg_path, width = w_in, height = h_in)
+        }
+        print(p); grDevices::dev.off(); TRUE
+      }, error = function(err) { try(grDevices::dev.off(), silent = TRUE); FALSE })
+      if (ok_svg && file.exists(svg_path) && file.info(svg_path)$size > 0)
+        return(basename(svg_path))
+      if (file.exists(svg_path)) unlink(svg_path)   # drop empty/partial svg
+      log_warn(paste0("SVG unavailable for ", basename(base_noext), "; using PNG"))
+    }
+    render_png()
   }
 
   entries <- list()
+  n_ok <- 0
   for (ifile in rdata_files) {
     well <- tools::file_path_sans_ext(basename(ifile))
-    profile_name <- paste0(well, "_profile.png")
-    hist_name    <- paste0(well, "_histogram.png")
-    compat_name  <- paste0(well, ".png")            # back-compat copy of the profile
-    ok_profile <- FALSE
-    ok_hist <- FALSE
-
+    profile_file <- NA_character_
+    hist_file <- NA_character_
     tryCatch({
       obj_name <- load(ifile)
       model <- get(obj_name[1])
-      # profile (same call as run_aneufinder.R profiles PDF, line ~184)
-      ok_profile <- render_plot(model, "profile",
-                                file.path(opt$outdir, profile_name), breakpoints = TRUE)
-      # bin-read-count histogram with fitted somy/state densities (run_aneufinder.R:185)
-      ok_hist <- render_plot(model, "histogram", file.path(opt$outdir, hist_name))
-      # keep {well}.png as a back-compat alias of the profile
-      if (ok_profile) {
-        file.copy(file.path(opt$outdir, profile_name),
-                  file.path(opt$outdir, compat_name), overwrite = TRUE)
-      }
+      # profile (same call as run_aneufinder.R profiles PDF) — wide for a readable x-axis
+      # very wide aspect so the genome x-axis (chromosome labels) is not crammed
+      profile_file <- render_vec(model, "profile",
+                                 file.path(opt$outdir, paste0(well, "_profile")),
+                                 24, 3.4, breakpoints = TRUE, format = opt$format)
+      # bin read-count histogram with fitted somy/state densities
+      hist_file <- render_vec(model, "histogram",
+                              file.path(opt$outdir, paste0(well, "_histogram")), 8, 3.4,
+                              format = opt$format)
     }, error = function(err) {
       try(grDevices::dev.off(), silent = TRUE)
       log_warn(paste0("Could not load model for ", well, ": ", err$message))
     })
-
+    if (!is.na(profile_file)) n_ok <- n_ok + 1
+    j <- function(x) if (is.na(x)) "null" else paste0("\"", json_escape(x), "\"")
     entries[[length(entries) + 1]] <- paste0(
       "{\"well\": \"", json_escape(well),
-      "\", \"profile_png\": \"", json_escape(profile_name),
-      "\", \"histogram_png\": \"", json_escape(hist_name),
-      "\", \"png\": \"", json_escape(compat_name),
-      "\", \"ok_profile\": ", if (ok_profile) "true" else "false",
-      ", \"ok_histogram\": ", if (ok_hist) "true" else "false",
-      ", \"ok\": ", if (ok_profile) "true" else "false", "}"
+      "\", \"profile\": ", j(profile_file),
+      ", \"histogram\": ", j(hist_file),
+      ", \"ok_profile\": ", if (!is.na(profile_file)) "true" else "false",
+      ", \"ok_histogram\": ", if (!is.na(hist_file)) "true" else "false", "}"
     )
   }
 
@@ -177,8 +199,8 @@ render_well_profiles <- function() {
   )
   writeLines(manifest, manifest_path)
   log_info(paste0("Wrote manifest: ", manifest_path))
-  log_info(paste0("Rendered ", sum(grepl("\"ok\": true", unlist(entries))),
-                  "/", length(entries), " profile PNGs to ", opt$outdir))
+  log_info(paste0("Rendered ", n_ok, "/", length(rdata_files),
+                  " per-well profile plots to ", opt$outdir))
 
   # Optional genome-wide CN heatmap (used by the second-pass / cn_review report).
   if (!is.null(opt$heatmap)) {
