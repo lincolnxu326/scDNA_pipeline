@@ -77,9 +77,9 @@ render_genome_heatmap <- function(rdata_files, path) {
     return(invisible(FALSE))
   }
   ok <- tryCatch({
-    # very wide so per-chromosome columns + labels are legible across the genome
-    grDevices::png(filename = path, width = 3000,
-                   height = max(420, 42 * length(rdata_files)), res = 110)
+    # very wide aspect so chromosome columns spread out when fit to the panel width
+    grDevices::png(filename = path, width = 7200,
+                   height = max(460, 46 * length(rdata_files)), res = 120)
     print(hp)
     grDevices::dev.off()
     TRUE
@@ -166,13 +166,13 @@ render_well_profiles <- function() {
       obj_name <- load(ifile)
       model <- get(obj_name[1])
       # profile (same call as run_aneufinder.R profiles PDF) — wide for a readable x-axis
-      # very wide aspect so the genome x-axis (chromosome labels) is not crammed
+      # readable default aspect (the very-wide 24in version squished the CN states)
       profile_file <- render_vec(model, "profile",
                                  file.path(opt$outdir, paste0(well, "_profile")),
-                                 24, 3.4, breakpoints = TRUE, format = opt$format)
-      # bin read-count histogram with fitted somy/state densities
+                                 14, 5, breakpoints = TRUE, format = opt$format)
+      # bin read-count histogram with fitted somy/state densities (default-ish aspect)
       hist_file <- render_vec(model, "histogram",
-                              file.path(opt$outdir, paste0(well, "_histogram")), 8, 3.4,
+                              file.path(opt$outdir, paste0(well, "_histogram")), 7, 4.5,
                               format = opt$format)
     }, error = function(err) {
       try(grDevices::dev.off(), silent = TRUE)

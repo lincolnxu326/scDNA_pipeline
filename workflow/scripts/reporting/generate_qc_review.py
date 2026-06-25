@@ -423,22 +423,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   header h1 { font-size:18px; margin:0; }
   header .meta { color:#555; font-size:13px; }
   header a { color:#1565c0; }
-  .layout { display:flex; gap:16px; padding:16px; align-items:flex-start; }
-  .left { flex:0 0 auto; }
+  .layout { display:flex; gap:12px; padding:12px; align-items:flex-start; }
+  .left { flex:0 0 auto; max-width:470px; }   /* ~ plate-map width; hint/legend wrap, no dead space */
   .right { flex:1 1 auto; min-width:0; }
-  .panel { background:#fff; border:1px solid #ddd; border-radius:6px; padding:14px; }
+  .panel { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px; }
   table.grid { border-collapse:collapse; }
   table.grid th { font-size:11px; color:#666; font-weight:600; padding:2px 4px; text-align:center; }
   table.grid td { padding:2px; }
-  .cell { position:relative; width:42px; height:32px; border-radius:4px; border:2px solid transparent;
-          color:#fff; font-size:10px; font-weight:600; cursor:pointer; display:flex;
-          flex-direction:column; align-items:center; justify-content:center; line-height:1.1;
+  .cell { position:relative; width:30px; height:24px; border-radius:3px; border:2px solid transparent;
+          color:#fff; font-size:9px; font-weight:600; cursor:pointer; display:flex;
+          flex-direction:column; align-items:center; justify-content:center; line-height:1.05;
           user-select:none; }
   .cell:hover { outline:1px solid #333; }
   .cell.sel { border-color:#111; box-shadow:0 0 0 2px #111 inset; }
   .cell.manual::after { content:""; position:absolute; top:2px; right:2px; width:6px; height:6px;
                         border-radius:50%; background:#fff; box-shadow:0 0 0 1px #111; }
-  .cell .dec { font-size:8px; letter-spacing:0.3px; opacity:0.95; }
+  .cell .dec { font-size:7px; letter-spacing:0.2px; opacity:0.95; }
   .legend { display:flex; gap:14px; margin-top:10px; font-size:12px; flex-wrap:wrap; }
   .legend span { display:inline-flex; align-items:center; gap:5px; }
   .swatch { width:13px; height:13px; border-radius:3px; display:inline-block; }
@@ -465,10 +465,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   textarea { font:inherit; padding:6px 8px; border:1px solid #bbb; border-radius:4px; width:100%; min-height:42px; }
   .savebtn { font:inherit; font-weight:600; padding:8px 18px; border:1px solid #2e7d32; background:#2e7d32;
              color:#fff; border-radius:5px; cursor:pointer; margin-top:10px; }
-  .plots { display:flex; flex-direction:column; gap:14px; margin-top:12px; }
-  .plotbox { width:100%; border:1px solid #eee; border-radius:4px; background:#fafafa; }
+  .plots { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
+  .plots.stack { flex-direction:column; flex-wrap:nowrap; }
+  .plotbox { flex:1 1 460px; min-width:320px; border:1px solid #eee; border-radius:4px; background:#fafafa; }
+  .plots.stack .plotbox { flex:1 1 auto; width:100%; max-width:1200px; }
+  .plotbox.narrow { max-width:820px; }
   .plotbox .cap { font-size:12px; color:#666; padding:4px 8px; border-bottom:1px solid #eee; }
-  .plotbox img { width:100%; height:auto; display:block; }
+  .plotbox img { width:100%; display:block; }
   .cell.excl { opacity:0.5; }
   .noplot { padding:20px; text-align:center; color:#999; font-style:italic; }
   .toolbar { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px 14px; margin:0 16px 16px; }
@@ -478,8 +481,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .toolbar code { background:#eef; padding:1px 5px; border-radius:3px; }
   .hint { font-size:12px; color:#555; margin-top:8px; line-height:1.5; }
   .progress { font-size:12px; color:#444; margin-left:auto; }
-  .mapwrap { display:flex; gap:16px; align-items:flex-start; }
-  .statcol { display:flex; flex-direction:column; gap:12px; }
+  .mapwrap { display:flex; flex-direction:column; gap:12px; align-items:flex-start; }
+  .statcol { display:flex; flex-direction:row; gap:10px; flex-wrap:wrap; }
   .statcard { border:1px solid #ddd; border-radius:8px; padding:12px 18px; min-width:150px;
               text-align:center; background:#fafafa; }
   .statcard .lbl { font-size:12px; color:#666; text-transform:uppercase; letter-spacing:.5px; }
@@ -499,7 +502,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <span class="progress" id="progress"></span>
 </header>
 
-<div class="panel" id="heatmapPanel" style="margin:0 16px 16px; display:none">
+<div class="panel" id="heatmapPanel" style="margin:0 12px 12px; display:none">
   <h2 style="margin:0 0 10px; font-size:16px">Genome-wide copy-number heatmap (second pass)</h2>
   <img id="heatmapImg" style="width:100%; border:1px solid #eee; border-radius:4px" alt="genome heatmap">
 </div>
@@ -625,9 +628,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     return '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td class="k">' + k + '</td><td>' + v + '</td></tr>';
   }
 
-  function plotBox(cap, uri, well, what) {
-    if (uri) return '<div class="plotbox"><div class="cap">' + cap + '</div><img src="' + uri + '" alt="' + what + ' ' + well + '"></div>';
-    return '<div class="plotbox"><div class="cap">' + cap + '</div><div class="noplot">No ' + what + ' for ' + well + '</div></div>';
+  function plotBox(cap, uri, well, what, cls) {
+    var c = "plotbox" + (cls ? " " + cls : "");
+    if (uri) return '<div class="' + c + '"><div class="cap">' + cap + '</div><img src="' + uri + '" alt="' + what + ' ' + well + '"></div>';
+    return '<div class="' + c + '"><div class="cap">' + cap + '</div><div class="noplot">No ' + what + ' for ' + well + '</div></div>';
   }
 
   function select(w) {
@@ -683,13 +687,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       html += '<button type="button" class="savebtn" id="btnSave">Save decision</button>';
     }
 
-    // plots: profile (full width) then histogram
-    html += '<div class="plots">';
+    // plots: review stacks profile/histogram vertically; cn keeps them side-by-side
+    html += '<div class="plots' + (APP.kind === 'review' ? ' stack' : '') + '">';
     if (APP.kind === 'cn' && !d.included) {
       html += '<div class="plotbox"><div class="noplot">Excluded at review &mdash; not included in the second AneuFinder pass.</div></div>';
     } else {
       html += plotBox("Copy-number profile", d.plot, d.well, "profile");
-      html += plotBox("Bin read-count histogram", d.histogram, d.well, "histogram");
+      html += plotBox("Bin read-count histogram", d.histogram, d.well, "histogram", "narrow");
     }
     html += '</div>';
 
