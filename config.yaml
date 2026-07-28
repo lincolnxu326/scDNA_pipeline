@@ -12,7 +12,10 @@ project_name: "SingleCell_ScDNA"
 #              AneuFinder + QC/CN review over all 384 wells.
 # Override at submit time: PLATE_FORMAT=384 sbatch submit_pipeline.sh
 plate_format: 96
-subplates: []          # [] = auto-discover <plate>_<n> dirs holding a FASTQ pair
+subplates: []          # [] = auto-discover <plate>_<n> dirs holding a FASTQ pair.
+                       # Name them explicitly when the subplate dirs do NOT carry the
+                       # plate dir's name — e.g. `plate17_umi/` holds plate17_1..4.
+                       # At submit time:  SUBPLATES="plate17_1 plate17_2 ..." sbatch …
 plate_layout_tsv: ""   # "" = the standard interleaved layout (derived by formula).
                        # Only set this for a non-standard 384 layout; the TSV needs
                        # columns: subplate, well, pos384.
@@ -114,7 +117,16 @@ qc_review:
   #         A 384 report with every asset base64-embedded would be ~107 MB.
   # true  = always embed;  false = always write sidecar assets
   embed_assets: auto
-  cell_images: true            # show the CellenONE cell-image panel when available
+  # true  show the CellenONE cell-image panel WHEN THE PLATE HAS IMAGES
+  # false never show it, even for a plate that does (forces no-cell-image mode)
+  #
+  # There is nothing to switch on for a plate with no images: a plate absent from
+  # `cellenone.runs` below never builds a cellenone/ directory, the review rule drops
+  # `--cellenone-dir`, and the report omits the image row and the droplet call — the
+  # Evidence section is then the copy-number profile and the bin-count histogram. So
+  # this can be left true for every plate; plate17/plate19 (no CellenONE) and plate21/22
+  # (CellenONE) are the same command.
+  cell_images: true
 
 # ============================================================================
 # CellenONE cell images (optional, DISPLAY-ONLY QC layer)

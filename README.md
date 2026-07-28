@@ -73,6 +73,15 @@ PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate21 sbatch submit_pipeline.sh
 Per-subplate preprocessing (demux → dedup → MultiQC) stays under each subplate
 directory. Only AneuFinder and the reporting layer become plate-level.
 
+Subplates are auto-discovered as `<plate>_<n>` directories holding a FASTQ pair. When
+they do **not** carry the plate directory's name — `384_well/plate17_umi/` holds
+`plate17_1`..`plate17_4` — name them explicitly instead:
+
+```bash
+PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate17_umi \
+SUBPLATES="plate17_1 plate17_2 plate17_3 plate17_4" sbatch submit_pipeline.sh
+```
+
 The 384 position of a well is derived, not looked up. For 384 row `r` (0–15 = A–P)
 and column `c` (0–23 = 1–24):
 
@@ -338,6 +347,22 @@ cellenone:
 Detection parameters (`DetDiaMinTrans`, the isolation window, fluorescence intensity
 limits) are always read from that run's own tables, never hardcoded — they vary
 between runs. Iterate on just this layer with `MODE=cellenone`.
+
+### Plates with no cell images
+
+Nothing needs switching off. A plate absent from `cellenone.runs` (plate17, plate19 and
+every plate dispensed before the CellenONE) never builds a `cellenone/` directory, the
+review rule drops `--cellenone-dir`, and `generate_qc_review.py` marks the report
+`cell_images: false`. The report then omits the image panel and the droplet call on the
+hover line entirely — rather than showing 384 empty frames — so the per-well evidence is
+the **copy-number profile and the bin-count histogram**. Everything else (the read gate,
+the diagnostics grid, decisions, the CSV) is unchanged.
+
+The same thing happens if a run folder is configured but yields no usable image: the
+report logs a warning and falls back to the no-image layout instead of failing.
+
+`qc_review.cell_images: false` in `config.yaml` forces that layout even for a plate that
+*does* have images.
 
 ## Outputs
 
