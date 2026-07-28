@@ -46,7 +46,11 @@ reproducible artefact; in this repo only `qc_decisions.csv.example` is tracked.
 
 ## Schema
 
-`<PLATE_DIR>/qc_decisions.csv` has a header row and one row per well:
+`<PLATE_DIR>/qc_decisions.csv` has a header row and one row per well. **Two schemas
+are valid**, and both are accepted indefinitely — a 96-well plate keeps producing the
+5-column form:
+
+**96-well (5 columns)** — `qc_decisions.csv.example`
 
 | column      | meaning                                                        |
 |-------------|----------------------------------------------------------------|
@@ -56,10 +60,31 @@ reproducible artefact; in this repo only `qc_decisions.csv.example` is tracked.
 | `reason`    | empty, or a `;`-separated list of controlled tokens (see below) |
 | `notes`     | free text (quote if it contains a comma)                       |
 
+**384-well (6 columns)** — `qc_decisions_384.csv.example`
+
+Identical, plus a `subplate` column immediately after `sample_id`. A well ID like
+`W07` is only unique *within* a subplate, so 384 mode keys on the `(subplate, well)`
+pair:
+
+| column      | meaning                                                        |
+|-------------|----------------------------------------------------------------|
+| `sample_id` | `{subplate}_{well}` (e.g. `plate21_2_W07`)                      |
+| `subplate`  | subplate directory name (e.g. `plate21_2`)                      |
+| `well`      | well ID within that subplate (e.g. `W07`)                       |
+| `decision`  | as above                                                        |
+| `reason`    | as above                                                        |
+| `notes`     | as above                                                        |
+
+`sample_id` is the same string whether a cell is reviewed in a standalone 96-well run
+of its subplate or as part of the whole 384 plate.
+
 **Allowed `reason` tokens** (the `reason` cell may be empty or hold several joined
 with `;`): `low_read_count`, `noisy_profile`, `poor_bin_distribution`,
 `low_complexity`, `suspected_doublet_or_mixed_well`, `sample_swap_suspected`,
 `manual_exception`, `other`, `missing_qc_metric`.
+
+This vocabulary is **frozen** — the CellenONE image QC layer deliberately introduced
+no new tokens; it only *suggests* an existing one (see below).
 
 Example with multiple reasons:
 
@@ -68,7 +93,10 @@ sample_id,well,decision,reason,notes
 SAMPLE_002,A02,EXCLUDE,low_read_count;noisy_profile,Weak CN signal
 ```
 
-See `qc_decisions.csv.example` for more.
+The review report writes whichever schema matches the plate it was built for, and
+`validate_qc_decisions.py` / `derive_included_wells.py` detect it from the header.
+`included_wells.tsv` mirrors the input schema: `sample_id\twell` or
+`sample_id\tsubplate\twell`.
 
 ## Automatic gating (read-count only)
 

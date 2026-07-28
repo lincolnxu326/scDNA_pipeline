@@ -3,6 +3,20 @@
 # Project name
 project_name: "SingleCell_ScDNA"
 
+# ============================================================================
+# Plate format
+# ============================================================================
+# 96  (default) one plate dir = one 96-well subplate = one FASTQ pair.
+# 384          one plate dir holds <plate>_1 .. <plate>_4 subplate dirs, each
+#              preprocessed exactly as a 96-well run, followed by ONE plate-level
+#              AneuFinder + QC/CN review over all 384 wells.
+# Override at submit time: PLATE_FORMAT=384 sbatch submit_pipeline.sh
+plate_format: 96
+subplates: []          # [] = auto-discover <plate>_<n> dirs holding a FASTQ pair
+plate_layout_tsv: ""   # "" = the standard interleaved layout (derived by formula).
+                       # Only set this for a non-standard 384 layout; the TSV needs
+                       # columns: subplate, well, pos384.
+
 # Reference genome - REQUIRED FORMAT: chr1-22, chrX, chrY
 genome:
   fasta: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/ref/GRCh38_canonical.fa"
@@ -62,6 +76,15 @@ aneufinder:
   cluster_plots: true          # Generate cluster plots
   reuse_existing: false
   reviewed_dir: "aneufinder_reviewed"  # output dir for the post-review (second) pass
+  min_reads_for_model: 100     # wells below this many mapped reads are not staged.
+                               # AneuFinder aborts the WHOLE batch on a near-empty well.
+  # 384 mode only. AneuFinder is per-cell, so a model computed in a subplate's own
+  # 96-well run is identical to the plate-level one; `reuse` symlinks those models
+  # into the plate-level MODELS dir and skips AneuFinder entirely.
+  #   auto   reuse when every subplate already has models, else compute (default)
+  #   reuse  always reuse; error if a subplate has no models
+  #   rerun  always recompute at plate level
+  plate384_models: auto
 
 # MultiQC settings
 multiqc:
@@ -82,6 +105,65 @@ qc_review:
   #   usable_reads missing                      -> auto_status UNKNOWN (default decision REVIEW)
   usable_reads_pass_cutoff: 100000
   usable_reads_warn_cutoff: 50000
+  # Per-well plot resolution (wired to render_well_profiles.R --res). 384 renders at
+  # a lower DPI: the plots directory goes from ~81 MB to ~36 MB with no loss of the
+  # detail a reviewer actually uses.
+  plot_res: 150
+  plot_res_384: 100
+  # auto  = self-contained single file at 96, sidecar `assets/` at 384.
+  #         A 384 report with every asset base64-embedded would be ~107 MB.
+  # true  = always embed;  false = always write sidecar assets
+  embed_assets: auto
+  cell_images: true            # show the CellenONE cell-image panel when available
+
+# ============================================================================
+# CellenONE cell images (optional, DISPLAY-ONLY QC layer)
+# ============================================================================
+# For every well the dispenser records three camera images (Transmission, Blue,
+# Orange) of the drop before it is ejected. They are overlaid, artificially
+# coloured, and scored against the two ejection lines to give an image-based call:
+#
+#   exactly 1 object                                  -> SINGLE
+#   >=2 objects, rightmost right of the purple line   -> PASS
+#   rightmost between the green and purple lines      -> CONTAMINATION
+#   all objects left of the green line                -> FAIL
+#   0 objects                                         -> NO_OBJECT
+#
+# The nozzle tip is at the LEFT and cells sediment leftwards toward it, so objects
+# far to the right are still up the capillary and will not be ejected.
+#
+# This call NEVER feeds the automated status or the default decision — it is shown
+# in its own panel and offers a suggested reason chip the reviewer may click.
+cellenone:
+  enable: true
+  # Run folder per plate. This mapping is NOT derivable from any name (CellenONE's
+  # `plate_2` is our `plate21`) — it must be stated explicitly. A plate with no
+  # entry here simply has the feature switched off.
+  runs:
+    plate21: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/input/P21_22/plate_2/K1563_plate_2_20260707_135300_812.Run"
+    plate22: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/input/P21_22/plate_3/K1563_V_plate_3_20260707_142633_771.Run"
+  min_object_diameter_um: null  # null -> DetDiaMinTrans read from that run's .xls
+  # Contrast of the fluorescence overlay. <1 lifts faint stain so the colour is
+  # obvious against the transmission image; the brightest pixels still saturate.
+  flu_gamma: 0.55
+  dark_threshold: 8             # median-minus-image intensity for "this pixel is an object"
+  median_sample: 60             # images sampled to build the per-run median background
+  # Ejection lines, in pixels. `auto` resolves in this order: hue auto-detect on an
+  # annotated Images_iso_det/Trans_*.jpg -> BackgroundEjZone width (purple) -> these
+  # defaults. run_meta.json records which source won.
+  lines: {green_x: auto, purple_x: auto, green_default: 396, purple_default: 647}
+  image:
+    scale: 0.5                  # downscale factor applied before JPEG encoding
+    quality: 72
+    # merge = transmission with every available fluorescence channel screen-blended
+    # over it, as in the cellenONE PDF report. Individual channels are also written so
+    # the reviewer can isolate one. Each extra channel is ~10 KB/well.
+    channels: [merge, trans, blue, orange, red]
+    annotate: true              # draw object outlines + index labels
+  # Artificial colour per channel. These are DISPLAY colours named after the
+  # instrument's own channel names (Blue / Orange / Red) — they are not the emission
+  # wavelength and say nothing about which marker was used; see README.
+  tint: {blue: [0.25, 0.55, 1.0], orange: [1.0, 0.55, 0.1], red: [1.0, 0.25, 0.25]}
 
 # Quality control thresholds
 qc_thresholds:
@@ -135,10 +217,28 @@ resources:
     time: 1440        # 24 hours in minutes
     partition: "ncpu"
 
+  aneufinder_384:         # ONE plate-level pass over all 384 wells
+    threads: 32
+    mem_mb: 512000
+    time: 2880        # 48 hours in minutes
+    partition: "ncpu"
+
+  aneufinder_link:        # 384 `reuse` mode: symlink existing models, no compute
+    threads: 1
+    mem_mb: 4000
+    time: 30
+    partition: "ncpu"
+
   aneufinder_reviewed:    # post-review second pass (fewer wells, so lighter)
     threads: 16
     mem_mb: 256000
     time: 720         # 12 hours in minutes
+    partition: "ncpu"
+
+  cellenone:
+    threads: 8
+    mem_mb: 16000
+    time: 120         # 2 hours in minutes
     partition: "ncpu"
     
   multiqc:
@@ -151,6 +251,12 @@ resources:
     threads: 4
     mem_mb: 16000
     time: 120          # 2 hours in minutes (per-well profile rendering)
+    partition: "ncpu"
+
+  qc_review_384:       # 384 wells of profiles + a 384-row genome heatmap
+    threads: 4
+    mem_mb: 64000
+    time: 180          # 3 hours in minutes
     partition: "ncpu"
 
 # Batch processing

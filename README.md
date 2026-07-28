@@ -44,24 +44,98 @@ scDNA_pipeline/
 
 User-facing helper scripts stay at the repository root so they are easy to find. Pipeline-owned execution code lives under `workflow/`. Ad hoc analysis or validation scripts that are not part of the active DAG live under `ad_hoc_checks/`.
 
+## Plate formats: 96 and 384
+
+`PLATE_FORMAT` (default `96`) selects how a plate directory is interpreted.
+
+**96-well** — one plate directory = one 96-well plate = one FASTQ pair. This is the
+original behaviour and is completely unchanged.
+
+**384-well** — a 384-well plate is dispensed as four interleaved 96-well subplates,
+each sequenced as its own FASTQ pair:
+
+```text
+384_well/plate21/
+├── plate21_1/          # SL1  — preprocessed exactly like a standalone 96-well run
+├── plate21_2/          # SL2
+├── plate21_3/          # SL3
+├── plate21_4/          # SL4
+├── aneufinder/         # ONE plate-level pass over all 384 wells
+├── cellenone/          # CellenONE cell images (optional)
+├── qc_review/          # ONE 384-well review
+└── CN_review/          # ONE 384-well CN viewer
+```
+
+```bash
+PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate21 sbatch submit_pipeline.sh
+```
+
+Per-subplate preprocessing (demux → dedup → MultiQC) stays under each subplate
+directory. Only AneuFinder and the reporting layer become plate-level.
+
+The 384 position of a well is derived, not looked up. For 384 row `r` (0–15 = A–P)
+and column `c` (0–23 = 1–24):
+
+```text
+subplate_index = (r % 2) + 2 * (c // 12)      # 0 -> SL1 … 3 -> SL4
+well_number    = (c % 12) * 8 + (r // 2) + 1  # W01..W96
+```
+
+so SL1 = rows A,C,E,… × cols 1–12, SL2 = rows B,D,F,… × cols 1–12, SL3/SL4 the same
+over cols 13–24, filling column-major within each subplate. Verified against all 384
+rows of `plate_mapping_384.xlsx`:
+
+```bash
+python workflow/scripts/reporting/plate384_layout.py --check-xlsx plate_mapping_384.xlsx
+# 384/384 OK
+```
+
+Set `plate_layout_tsv` in `config.yaml` only for a non-standard layout.
+
+Well identity in 384 mode is `<subplate>_<well>` (e.g. `plate21_2_W07`) — the same
+`sample_id` a standalone run of that subplate produces, so a cell keeps its identity
+whether it is reviewed alone or as part of the plate. That one string is also the
+staged BAM basename, the AneuFinder model id, the `.RData` name and the plot name,
+which is why `run_aneufinder.R` needs no changes for 384 mode.
+
+### Reusing already-processed subplates
+
+If a plate's four subplates have already been through their own 96-well runs, the
+plate-level AneuFinder pass costs nothing. AneuFinder is strictly per-cell — each BAM
+is independently binned, GC-corrected and segmented — so a subplate's model is
+identical to the plate-level one. `aneufinder.plate384_models` controls this:
+
+| value   | behaviour                                                       |
+|---------|-----------------------------------------------------------------|
+| `auto`  | reuse when every subplate already has models, else compute (default) |
+| `reuse` | always reuse; error if a subplate has no models                 |
+| `rerun` | always recompute at plate level                                 |
+
+In `reuse` mode the existing models are symlinked into the plate-level `MODELS/`
+directory under their namespaced ids, and a full 384-well review becomes available in
+minutes without running AneuFinder once.
+
 ## Inputs
 
-Each plate run expects:
+Each (sub)plate run expects:
 
-- paired plate FASTQs such as `<plate>_R1.fastq.gz` and `<plate>_R2.fastq.gz`
+- paired FASTQs named after their directory: `<dir>/<dir>_R1.fastq.gz` and `_R2.fastq.gz`
 - a barcode table for well demultiplexing
 - reference configuration in `config.yaml`
 - a mappability reference BAM for blacklist diagnostics
 - a GC template RDS for the AneuFinder stage
 
-Barcode lookup now follows this order:
+Barcode lookup follows this order:
 
 1. `resources/barcodes.tsv`
 2. `resources/barcodes/barcodes.tsv`
-3. `<plate_dir>/barcodes.tsv`
+3. `<plate_dir>/barcodes.tsv` — **resolved per subplate in 384 mode**, i.e.
+   `<plate_dir>/<subplate>/barcodes.tsv`
 
 This allows a shared barcode definition to be reused across multiple plate runs
-without copying `barcodes.tsv` into every plate directory.
+without copying `barcodes.tsv` into every plate directory. 384 mode additionally
+requires the `well_id` order to be identical across subplates, and says so explicitly
+if it is not.
 
 The exact file paths are otherwise controlled through `submit_pipeline.sh` and
 `config.yaml`.
@@ -228,6 +302,43 @@ If a shared barcode table is used, place it in either:
 If neither shared location exists, the pipeline falls back to
 `<plate_dir>/barcodes.tsv`.
 
+## CellenONE cell images (optional, display-only)
+
+For every well the CellenONE dispenser photographs the drop in three channels
+(Transmission, Blue, Orange) before ejecting it. The pipeline overlays those,
+artificially colours the fluorescence channels, and scores the transmission image
+against the two ejection lines to produce an **image-based call**:
+
+| condition                                          | call            |
+|----------------------------------------------------|-----------------|
+| exactly 1 object                                   | `SINGLE`        |
+| ≥2 objects, rightmost right of the purple line     | `PASS`          |
+| rightmost between the green and purple lines       | `CONTAMINATION` |
+| all objects left of the green line                 | `FAIL`          |
+| 0 objects                                          | `NO_OBJECT`     |
+
+The nozzle is at the **left** and cells sediment leftwards toward it, so an object far
+to the right is still up the capillary and will not be ejected.
+
+**This call is display-only.** Read-count gating remains the sole driver of
+`auto_status` and the default decision; the image call gets its own panel and offers a
+*suggested* reason chip that the reviewer must click to apply. It introduces no new
+reason tokens.
+
+Enable it by mapping the plate to its run folder in `config.yaml` — this mapping is
+not derivable from any name (CellenONE's `plate_2` is our `plate21`) and is never
+guessed:
+
+```yaml
+cellenone:
+  runs:
+    plate21: "/…/P21_22/plate_2/K1563_plate_2_20260707_135300_812.Run"
+```
+
+Detection parameters (`DetDiaMinTrans`, the isolation window, fluorescence intensity
+limits) are always read from that run's own tables, never hardcoded — they vary
+between runs. Iterate on just this layer with `MODE=cellenone`.
+
 ## Outputs
 
 Per-plate outputs are written into the selected plate directory. Typical generated folders include:
@@ -244,9 +355,41 @@ Per-plate outputs are written into the selected plate directory. Typical generat
 - `multiqc/`
 - `qc_review/`
 - `CN_review/`
+- `cellenone/` (only when CellenONE images are configured)
 - `logs/`
 
+In 384 mode the first six of those stay under each `<plate>/<subplate>/` directory and
+the rest are plate-level.
+
 These generated outputs are intentionally excluded from version control.
+
+### Report size
+
+A 96-well `review.html` is a single self-contained file with every plot base64-embedded
+(~20 MB), which is what makes it open correctly over Samba or as a `file://` document.
+At 384 wells that approach would produce a ~107 MB page, so 384 mode switches to
+relative asset references (`qc_review.embed_assets: auto`) and the browser fetches only
+the clicked well. Measured on plate21:
+
+| | 96-well (plate21_1) | 384-well (plate21) |
+|---|---|---|
+| `review.html` | 20.4 MB (self-contained) | **0.46 MB** + referenced assets |
+| `qc_review/plots/` | 16 MB @ 150 dpi | 46 MB @ 100 dpi (`plot_res_384`) |
+| `qc_review/assets/` (cell images) | — | 13 MB (768 JPEGs, ~17 KB each) |
+
+Both size levers are config: `qc_review.plot_res_384` (the per-well plot DPI) and
+`cellenone.image.channels` — the default `[merge, trans]` is two JPEGs per well;
+adding `blue` and `orange` doubles the assets directory.
+
+`qc_review.embed_assets: true` forces the single-file behaviour at any size.
+
+### Reviewing a 384 plate
+
+`review.html` shows one 16×24 plate map (rows A–P, columns 1–24) with a tab strip
+`All | SL1 | SL2 | SL3 | SL4` above it. Selecting a subplate dims the other 288 wells;
+**dimmed wells stay clickable**, since the filter is a focus aid rather than a lockout.
+At 24 columns there is no room for per-cell text, so each cell carries a tooltip and a
+hover readout appears under the map. The exported CSV gains a `subplate` column.
 
 ## Development Notes
 

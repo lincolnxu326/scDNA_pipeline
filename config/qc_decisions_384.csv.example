@@ -1,0 +1,6 @@
+sample_id,subplate,well,decision,reason,notes
+plate21_1_W01,plate21_1,W01,PASS,,
+plate21_1_W02,plate21_1,W02,EXCLUDE,low_read_count,
+plate21_2_W07,plate21_2,W07,PASS,,
+plate21_3_W11,plate21_3,W11,REVIEW,poor_bin_distribution,borderline
+plate21_4_W22,plate21_4,W22,EXCLUDE,low_read_count,dead well

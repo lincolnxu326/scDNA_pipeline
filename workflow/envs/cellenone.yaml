@@ -1,0 +1,21 @@
+# Environment for the CellenONE cell-image QC layer (ingest + rendering).
+#
+# Deliberately SEPARATE from qc.yaml: that env is shared by multiqc / fastqc /
+# validate / derive, and adding scipy+pillow there would force a rebuild of an
+# environment several finished stages already depend on. generate_qc_review.py only
+# reads TSV/JSON and references the JPEGs this env produces, so it needs nothing
+# from here.
+name: sc_cellenone
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy          # ndimage: labelling, morphology, fill-holes
+  - pillow         # PNG decode + JPEG encode
+  - pandas
+  - pyyaml         # both scripts read config.yaml
+  - openpyxl       # only for optional .xlsx cross-checks; the CellenONE
+                   # "*.xls" files are actually tab-separated text

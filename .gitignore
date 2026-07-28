@@ -30,6 +30,18 @@ config/qc_decisions.csv
 ad_hoc_checks/*
 !ad_hoc_checks/*.R
 
+# Python bytecode (plate384_layout.py is imported at Snakefile parse time and by the
+# reporting scripts, so several interpreters drop caches next to it)
+__pycache__/
+*.pyc
+
+# UI design material handed over by the design agent: the prototype, the spec, the
+# handoff CSS/JS, screenshots and scratch assets. Kept on disk as the reference for
+# how the report is meant to look, but not part of the pipeline — the code the
+# pipeline actually runs is workflow/scripts/reporting/assets/qc_review.{css,js},
+# which IS tracked.
+design/
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

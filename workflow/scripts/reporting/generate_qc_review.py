@@ -5,29 +5,66 @@ Build the static HTML QC review report for one plate.
 This reads the per-well QC metrics already produced by the pipeline
 (samtools stats, dedup / filter summaries, demux stats) plus the per-well
 AneuFinder profile PNGs rendered by render_well_profiles.R, computes an
-advisory automated QC status from config.yaml `qc_thresholds`, and writes a
-single self-contained `review.html`.
+advisory read-count gate status from config.yaml `qc_review.usable_reads_*_cutoff`,
+and writes a single self-contained `review.html`.
+
+Layout, styling and behaviour live in `assets/qc_review.{css,js}` next to this
+script and are pasted into the page verbatim; the markup is `HTML_TEMPLATE` at the
+bottom. Python's whole job here is to build the `window.QC` payload (the data
+contract in `design/handoff/README.md`) and substitute the `__UPPER_SNAKE__` tokens. The
+JS owns the grid, selection, decision state, localStorage autosave, keyboard,
+filters, CSV and the chromosome axis — do not reimplement any of that here.
 
 Design constraints (deliberate):
-  * Fully static. No server, no database, no external requests.
-  * Per-well plot PNGs are base64-embedded so the page opens correctly over
-    Samba / as a local file:// document.
+  * Fully static. No server, no database, no external requests, no web fonts.
   * The browser only ever *generates* copyable text, a downloaded CSV, or a
     copyable shell command; it never writes into the project directory. The
     reproducible human artefact is `<PLATE_DIR>/qc_decisions.csv` (per plate),
-    which the user saves by hand or via the in-page "Copy terminal save command".
+    which the user saves by hand or via the in-page "COPY SAVE COMMAND".
+  * Asset handling depends on plate format:
+      96  — every plot is base64-embedded, so `review.html` is a single
+            self-contained file that opens correctly over Samba or as file://.
+      384 — assets are referenced relatively (`plots/…`, `assets/…`) instead.
+            384 wells of embedded plots plus cell images would be a ~107 MB page
+            that no browser opens comfortably; referencing them keeps the HTML
+            small and makes the browser fetch only the clicked well.
+
+384 mode
+--------
+A 384-well plate is four interleaved 96-well subplates. This report shows all four
+in ONE 16x24 plate map, each well still labelled with the subplate it came from, and
+a tab strip (`All | SL1 | SL2 | SL3 | SL4`) that dims wells outside the selection.
+Well identity is `<subplate>_<well>` (e.g. `plate21_1_W01`) — identical to what a
+standalone run of that subplate produces, so a cell keeps the same `sample_id`
+whether it is reviewed alone or as part of the plate.
 """
 
 import argparse
 import base64
+import csv
+import html
 import json
 import logging
+import os
+import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
-# Controlled vocabularies (kept in sync with validate_qc_decisions.py and config/README.md)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import plate384_layout as L384
+
+# The stylesheet and behaviour, pasted into every report verbatim. Both are copies of
+# `design/handoff/` — diff against that folder before editing either, and change the prototype
+# (`QC Review Redesign.dc.html`) first if the design itself needs to move.
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
+# Controlled vocabularies (kept in sync with validate_qc_decisions.py and config/README.md).
+# The page has its own copy in assets/qc_review.js (DECISIONS / REASON_GROUPS, which also
+# fixes how the reasons are grouped in the drawer) — change both together or the CSV a
+# reviewer produces will not validate.
 DECISIONS = ["PASS", "EXCLUDE", "REVIEW", "REPEAT"]
 REASONS = [
     "low_read_count",
@@ -60,9 +97,13 @@ def parse_args():
     p.add_argument("--plate", required=True, help="Plate name")
     p.add_argument("--plate-dir", required=True, help="Per-plate output directory")
     p.add_argument("--multiqc-data", required=False, default="",
-                   help="multiqc_data directory (optional enrichment)")
+                   help=argparse.SUPPRESS)   # DEPRECATED: accepted but never read.
+    # Kept only so an existing caller does not break. The pipeline no longer passes
+    # it: the value was never used, and the plate-level `<plate>/multiqc/multiqc_data`
+    # it named does not exist for a 384 plate. The header links MultiQC relatively
+    # instead — see the `multiqc_href` block in main().
     p.add_argument("--plots-dir", required=True, help="Directory of per-well {well}.png")
-    p.add_argument("--config", required=True, help="Pipeline config.yaml (for qc_thresholds)")
+    p.add_argument("--config", required=True, help="Pipeline config.yaml (gate cutoffs, binsize)")
     p.add_argument("--outdir", required=True, help="Output directory (writes the HTML report)")
     p.add_argument("--wells", required=True, nargs="+", help="Ordered list of well IDs")
     p.add_argument("--decisions-path", default="",
@@ -75,28 +116,82 @@ def parse_args():
     p.add_argument("--heatmap", default="", help="Genome-wide CN heatmap PNG to embed (cn mode)")
     p.add_argument("--title", default="", help="Override report title")
     p.add_argument("--out-name", default="", help="Output HTML filename (default depends on kind)")
+    # --- 384 mode (all additive; with --subplates empty every path below is unchanged)
+    p.add_argument("--subplates", nargs="*", default=[],
+                   help="Subplate names in SL order. Given => 384 mode.")
+    p.add_argument("--layout-tsv", default="",
+                   help="Optional 384 layout override TSV (subplate, well, pos384)")
+    p.add_argument("--cellenone-dir", default="",
+                   help="<plate>/cellenone directory (enables the cell-image panel)")
+    p.add_argument("--assets-mode", choices=["embed", "sidecar"], default="embed",
+                   help="embed = base64 data URIs (96); sidecar = relative refs (384)")
+    p.add_argument("--assets-dir", default="",
+                   help="Sidecar directory for assets that live outside --outdir "
+                        "(default: <outdir>/assets)")
     return p.parse_args()
 
 
 def load_included_wells(path: str) -> list:
-    """Read an included_wells.tsv (sample_id\\twell) and return the well column."""
+    """Read an included_wells.tsv and return the well IDENTITIES it lists.
+
+    Returns `<subplate>_<well>` when the file carries a subplate column (384 mode)
+    and plain `<well>` otherwise, so the result always matches `wells_order`.
+    """
     if not path:
         return []
     p = Path(path)
     if not p.exists():
         return []
-    wells = []
-    with open(p) as fh:
-        header = fh.readline().rstrip("\n").split("\t")
+    out = []
+    with open(p, newline="") as fh:
+        header = [h.strip() for h in fh.readline().rstrip("\r\n").split("\t")]
         try:
             widx = header.index("well")
         except ValueError:
             widx = 1 if len(header) > 1 else 0
+        sidx = header.index("subplate") if "subplate" in header else None
         for line in fh:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) > widx and parts[widx].strip():
-                wells.append(parts[widx].strip())
-    return wells
+            parts = [c.strip() for c in line.rstrip("\r\n").split("\t")]
+            if len(parts) <= widx or not parts[widx]:
+                continue
+            if sidx is not None and len(parts) > sidx and parts[sidx]:
+                out.append(f"{parts[sidx]}_{parts[widx]}")
+            else:
+                out.append(parts[widx])
+    return out
+
+
+def load_cellenone(cellenone_dir: str):
+    """Load the CellenONE ingest/render outputs, if present.
+
+    Returns (run_meta, {id: well_row}, {id: [object_row, …]}). Everything here is
+    DISPLAY-ONLY — see the note on compute_status().
+    """
+    if not cellenone_dir:
+        return {}, {}, {}
+    cdir = Path(cellenone_dir)
+    meta = {}
+    meta_path = cdir / "run_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+
+    wells = {}
+    wells_path = cdir / "cellenone_wells.tsv"
+    if wells_path.exists():
+        with open(wells_path, newline="") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                wells[row["id"]] = row
+
+    objects = defaultdict(list)
+    obj_path = cdir / "objects.tsv"
+    if obj_path.exists():
+        with open(obj_path, newline="") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                objects[row["id"]].append(row)
+    return meta, wells, objects
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +199,18 @@ def load_included_wells(path: str) -> list:
 # ---------------------------------------------------------------------------
 
 def parse_samtools_stats(stats_file: Path) -> dict:
-    """Parse the SN block of a samtools stats file (post-dedup BAM)."""
+    """Parse the SN block of a samtools stats file (post-dedup BAM), plus mean GC%.
+
+    GC comes free: samtools already writes GCF/GCL — the GC-content *distribution*
+    of first/last fragments as (gc_percent, read_count) pairs — so the per-well mean
+    is a weighted average over those rows. No extra tool, no re-run.
+    """
     out = {"reads": None, "mapped_reads": None, "average_quality": None,
-           "mapping_rate": None}
+           "mapping_rate": None, "gc_content": None}
     if not stats_file.exists():
         return out
     total = mapped = None
+    gc_num = gc_den = 0.0
     with open(stats_file) as fh:
         for line in fh:
             if line.startswith("SN\traw total sequences:"):
@@ -118,10 +219,20 @@ def parse_samtools_stats(stats_file: Path) -> dict:
                 mapped = int(line.split("\t")[2])
             elif line.startswith("SN\taverage quality:"):
                 out["average_quality"] = float(line.split("\t")[2])
+            elif line.startswith("GCF\t") or line.startswith("GCL\t"):
+                parts = line.split("\t")
+                try:
+                    gc_pct, n = float(parts[1]), float(parts[2])
+                except (IndexError, ValueError):
+                    continue
+                gc_num += gc_pct * n
+                gc_den += n
     out["reads"] = total
     out["mapped_reads"] = mapped
     if total and total > 0 and mapped is not None:
         out["mapping_rate"] = round(mapped / total * 100, 2)
+    if gc_den > 0:
+        out["gc_content"] = round(gc_num / gc_den, 2)
     return out
 
 
@@ -168,13 +279,11 @@ def load_demux_totals(path: Path) -> dict:
 # Automated status — read-count-only gating
 # ---------------------------------------------------------------------------
 
-# auto_status -> default decision mapping (read-count-only gating)
-STATUS_DEFAULT_DECISION = {
-    "PASS": "PASS",
-    "WARN": "REVIEW",
-    "FAIL": "EXCLUDE",
-    "UNKNOWN": "REVIEW",
-}
+# auto_status -> the gate status the report renders. The UI has three gate colours,
+# not four (spec §1), so a well with no usable_reads at all is shown as FAIL: it has
+# no measurement to pass on, and its `flags` still say why. The reviewer then sees the
+# FAIL default (EXCLUDE), so the well is visibly written off rather than quietly.
+GATE_STATUS = {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL", "UNKNOWN": "FAIL"}
 
 
 def compute_status(usable_reads, pass_cutoff: int, warn_cutoff: int) -> tuple:
@@ -183,6 +292,16 @@ def compute_status(usable_reads, pass_cutoff: int, warn_cutoff: int) -> tuple:
 
     usable_reads = mapped reads in the dedup BAM. Duplication is NOT used for gating.
     Advisory only — never overrides the human call.
+
+    Only auto_status (through GATE_STATUS) and flags reach the report: the page derives
+    the pre-selected decision from the gate status itself, so default_decision and
+    default_reason are here for callers and tests, not for the UI.
+
+    DO NOT reintroduce duplication gating here, and DO NOT add the CellenONE image
+    call. The image call is display-only: it gets its own labelled panel and at most
+    offers a *suggested* reason chip the reviewer clicks. Letting it move auto_status
+    or the default decision would silently re-gate wells on a heuristic the operator
+    never opted into.
     """
     if usable_reads is None:
         return ("UNKNOWN", "REVIEW", "missing_qc_metric", ["missing usable_reads"])
@@ -199,10 +318,18 @@ def compute_status(usable_reads, pass_cutoff: int, warn_cutoff: int) -> tuple:
 
 def well_positions(wells: list) -> dict:
     """
-    Map each well to a (row, col) grid position.
+    Map each well to its PHYSICAL (row, col) on the 8x12 grid.
 
-    Uses true positional IDs when every well matches A-H + 01-12; otherwise
-    falls back to a sequential 8x12 (then wider) fill in the given order.
+    Three shapes, tried in order:
+      A1..H12   the id *is* the position.
+      W01..W96  the dispense is column-major down the 8 rows, so
+                row = (n-1) % 8, col = (n-1) // 8 — the same geometry
+                plate384_layout applies inside one subplate.
+      anything else, or a list that will not fit 8x12: a sequential
+                row-major fill, 12 columns, as many rows as needed.
+
+    The old code used the sequential fill for W-numbered wells too, which
+    transposed the plate: a bad physical column read as a bad row (spec §0).
     """
     import re
     pos = {}
@@ -220,9 +347,17 @@ def well_positions(wells: list) -> dict:
         pos[w] = (row, col)
 
     if positional and pos:
-        ncols = 12
-        nrows = 8
-        return {"mode": "positional", "rows": nrows, "cols": ncols, "pos": pos}
+        return {"mode": "positional", "rows": 8, "cols": 12, "pos": pos}
+
+    try:
+        pos = {}
+        for w in wells:
+            n0 = L384.parse_well(w) - 1
+            pos[w] = (n0 % L384.SUB_ROWS, n0 // L384.SUB_ROWS)
+        if pos:
+            return {"mode": "physical", "rows": 8, "cols": 12, "pos": pos}
+    except ValueError:
+        pass
 
     # Sequential fill: 12 columns, as many rows as needed.
     ncols = 12
@@ -231,36 +366,206 @@ def well_positions(wells: list) -> dict:
     return {"mode": "sequential", "rows": nrows, "cols": ncols, "pos": pos}
 
 
+def well_positions_384(layout: list) -> dict:
+    """The 16x24 plate map, keyed by well identity rather than well id.
+
+    buildMap() in the template needs no structural change for this:
+    `String.fromCharCode(65 + r)` already yields A..P and `c + 1` yields 1..24.
+    """
+    return {"mode": "384", "rows": L384.N_ROWS, "cols": L384.N_COLS,
+            "pos": {e["id"]: (e["row"], e["col"]) for e in layout}}
+
+
 # ---------------------------------------------------------------------------
-# HTML assembly
+# Assets — embedded data URIs (96) or relative references (384)
 # ---------------------------------------------------------------------------
 
-def embed_png(path: Path) -> str:
-    if not path.exists():
-        return ""
+MIME_BY_SUFFIX = {".png": "image/png", ".svg": "image/svg+xml",
+                  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
+
+
+def data_uri(path: Path) -> str:
+    mime = MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{data}"
+    return f"data:{mime};base64,{data}"
 
 
-def embed_well_plot(plots_dir: Path, well: str, suffix: str) -> str:
-    """Embed {well}_{suffix} as a data URI, preferring SVG (vector, responsive) then PNG.
+class AssetRefs:
+    """Turn a file on disk into something the HTML can point at.
 
-    Also falls back to the legacy {well}.png (profile only)."""
+    embed   -> a base64 data URI (one self-contained file; the 96-well behaviour).
+    sidecar -> a relative path that NEVER points above the report directory.
+
+               Assets already inside `<outdir>` (the report's own `plots/`) are
+               referenced where they lie. Everything else — chiefly the plate-level
+               `cellenone/images/` next door — is brought into `<outdir>/assets/`.
+
+               `../cellenone/images/…` was tried and is wrong: the report is read over
+               a Samba share and is routinely copied around, and the moment
+               `qc_review/` travels without its parent every cell image 404s. The rule
+               is simply that a report must be openable from its own directory.
+
+               To keep that cheap, assets are HARD LINKED rather than copied — at 384
+               with every channel on that is ~1,540 files, and copying meant a second
+               13 MB and minutes of `copy2` on a busy shared filesystem. A hard link is
+               instant, adds no bytes, and (unlike a symlink) is an ordinary file to
+               Samba and to anything that later copies the tree. Falls back to a real
+               copy when the link cannot be made (different filesystem, or an fs
+               without hard links).
+    """
+
+    def __init__(self, mode: str, outdir: Path, assets_dir: Path = None,
+                 base_dir: Path = None):
+        self.mode = mode
+        self.outdir = Path(outdir).resolve()
+        # Retained for callers; only `outdir` decides what is referenced in place.
+        self.base_dir = Path(base_dir).resolve() if base_dir else self.outdir
+        self.assets_dir = Path(assets_dir) if assets_dir else self.outdir / "assets"
+        self.n_embedded = 0
+        self.n_linked = 0
+        self.n_copied = 0
+        self.n_hardlinked = 0
+        self.bytes_embedded = 0
+
+    def ref(self, path) -> str:
+        if not path:
+            return ""
+        path = Path(path)
+        if not path.exists():
+            return ""
+        if self.mode == "embed":
+            self.n_embedded += 1
+            self.bytes_embedded += path.stat().st_size
+            return data_uri(path)
+        resolved = path.resolve()
+        try:
+            rel = resolved.relative_to(self.outdir)
+        except ValueError:
+            pass                     # outside the report dir -> bring it inside
+        else:
+            self.n_linked += 1
+            return str(rel).replace(os.sep, "/")
+
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.assets_dir / path.name
+        stale = (not dest.exists()) or dest.stat().st_mtime < resolved.stat().st_mtime
+        if stale:
+            if dest.exists():
+                dest.unlink()
+            try:
+                os.link(resolved, dest)          # same fs: instant, no extra bytes
+                self.n_hardlinked += 1
+            except OSError:
+                shutil.copy2(resolved, dest)     # cross-device or no hardlink support
+                self.n_copied += 1
+        self.n_linked += 1
+        rel_dir = os.path.relpath(self.assets_dir, self.outdir).replace(os.sep, "/")
+        return f"{rel_dir}/{path.name}"
+
+    def summary(self) -> str:
+        if self.mode == "embed":
+            return f"embedded {self.n_embedded} asset(s), {self.bytes_embedded / 1e6:.1f} MB"
+        return (f"referenced {self.n_linked} asset(s) "
+                f"({self.n_hardlinked} hard-linked, {self.n_copied} copied "
+                f"into {self.assets_dir.name}/)")
+
+
+def well_plot_path(plots_dir: Path, well: str, suffix: str):
+    """Locate {well}_{suffix}, preferring SVG (vector) then PNG.
+
+    Falls back to the legacy {well}.png (profile only). Returns None if absent.
+    """
     svg = plots_dir / f"{well}_{suffix}.svg"
     if svg.exists():
-        data = base64.b64encode(svg.read_bytes()).decode("ascii")
-        return f"data:image/svg+xml;base64,{data}"
+        return svg
     png = plots_dir / f"{well}_{suffix}.png"
     if png.exists():
-        return embed_png(png)
+        return png
     if suffix == "profile":
-        return embed_png(plots_dir / f"{well}.png")
-    return ""
+        legacy = plots_dir / f"{well}.png"
+        if legacy.exists():
+            return legacy
+    return None
 
 
-def build_html(app: dict) -> str:
-    data_blob = json.dumps(app, separators=(",", ":"))
-    return HTML_TEMPLATE.replace("__DATA_BLOB__", data_blob)
+# ---------------------------------------------------------------------------
+# Rendering — build the payload, substitute the tokens, paste in the CSS/JS
+# ---------------------------------------------------------------------------
+
+# The usable-reads bar in the inspector is a FIXED scale (spec §4), so every well is
+# read against the same ruler; only the two gate markers move with the config.
+USABLE_SCALE = 500000
+
+
+def read_label(n) -> str:
+    """50000 -> '50k', 100000 -> '100k', 1500000 -> '1.5M'. Used for the gate labels."""
+    if n is None:
+        return "?"
+    if n >= 1e6:
+        return f"{n / 1e6:g}M"
+    if n >= 1e3:
+        return f"{n / 1e3:g}k"
+    return str(int(n))
+
+
+def read_label_bp(n) -> str:
+    """1000000 -> '1 Mb', 500000 -> '500 kb'. The profile caption's bin size."""
+    if not n:
+        return ""
+    if n >= 1e6:
+        return f"{n / 1e6:g} Mb"
+    if n >= 1e3:
+        return f"{n / 1e3:g} kb"
+    return f"{int(n)} bp"
+
+
+def bar_pct(n) -> str:
+    """Where a cutoff sits on the fixed 0-500k usable-reads bar, as a CSS length."""
+    return f"{min(100.0, max(0.0, 100.0 * (n or 0) / USABLE_SCALE)):g}%"
+
+
+def as_number(raw, cast):
+    """TSV cells are strings and may be empty. Absent stays None, never 0."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return cast(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_asset(name: str) -> str:
+    path = ASSETS_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(
+            f"missing report asset {path}. The CSS and JS are pasted into the report "
+            f"verbatim; without them there is no report."
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def render(template: str, payload: dict, tokens: dict) -> str:
+    """Substitute the `__UPPER_SNAKE__` tokens.
+
+    str.replace, never %-formatting or .format(): the CSS is full of braces. The CSS,
+    JS and JSON go in LAST so that nothing already substituted can be re-scanned, and
+    `</` is escaped inside the JSON so a stray string can never close the <script>.
+    """
+    import re
+    blob = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    late = {"__QC_CSS__": read_asset("qc_review.css"),
+            "__QC_JS__": read_asset("qc_review.js"),
+            "__QC_JSON__": blob}
+    missing = sorted(set(re.findall(r"__[A-Z0-9_]+__", template)) - set(tokens) - set(late))
+    if missing:
+        raise AssertionError(f"template token(s) with nothing to substitute: {missing}")
+
+    out = template
+    for token, value in sorted(tokens.items(), key=lambda kv: -len(kv[0])):
+        out = out.replace(token, value)
+    for token, value in late.items():
+        out = out.replace(token, value)
+    return out
 
 
 def main():
@@ -280,7 +585,21 @@ def main():
     warn_cutoff = review_cfg.get("usable_reads_warn_cutoff", DEFAULT_WARN_CUTOFF)
 
     kind = args.report_kind
-    wells = args.wells          # always the FULL plate (cn viewer greys out excluded wells)
+
+    # ---- plate layout -------------------------------------------------------
+    subplates = list(args.subplates or [])
+    is_384 = bool(subplates)
+    if is_384:
+        layout = L384.build_layout(subplates, wells=args.wells,
+                                   layout_tsv=args.layout_tsv or None)
+        geom = well_positions_384(layout)
+    else:
+        layout = [{"id": w, "subplate": args.plate, "sub_index": 0,
+                   "sub_label": args.plate, "well": w, "pos384": "",
+                   "sample_id": f"{args.plate}_{w}"} for w in args.wells]
+        geom = well_positions(args.wells)
+
+    ids = [e["id"] for e in layout]   # always the FULL plate (cn greys out excluded)
     included_set = set()
     if kind == "cn":
         included = load_included_wells(args.included_wells)
@@ -290,39 +609,64 @@ def main():
         included_set = set(included)
         # The cn viewer shows the WHOLE plate: included (PASS) wells keep their original
         # auto-status colour and carry second-pass plots; excluded wells are greyed out.
-    logger.info("Building %s report for plate %s (%d wells, %d included)",
-                kind, args.plate, len(wells), len(included_set) if kind == "cn" else len(wells))
+    logger.info("Building %s report for plate %s (%d wells%s, %d included)",
+                kind, args.plate, len(ids),
+                f", {len(subplates)} subplates" if is_384 else "",
+                len(included_set) if kind == "cn" else len(ids))
 
-    # ---- aggregate per-well metrics ----------------------------------------
-    dedup = load_tsv_by_well(
-        plate_dir / "dedup" / "dedup_summary.tsv",
-        {"unique_reads": "unique_reads", "duplicate_reads": "duplicate_reads",
-         "dedup_rate": "dedup_rate"},
-    )
-    dimers = load_tsv_by_well(
-        plate_dir / "filtered" / "adapter_filter_summary.tsv",
-        {"dimer_rate": "dimer_rate", "kept_pairs": "kept_pairs"},
-    )
-    demux_totals = load_demux_totals(plate_dir / "demux" / "demux_stats.json")
+    assets = AssetRefs(args.assets_mode, outdir,
+                       Path(args.assets_dir) if args.assets_dir else None,
+                       base_dir=plate_dir)
 
-    geom = well_positions(wells)
+    # ---- per-subplate metric sources ---------------------------------------
+    # The preprocessing outputs stay under each subplate directory in 384 mode; the
+    # existing loaders are reused verbatim, just pointed at the right directory.
+    sources = {}
+    for sub in (subplates or [args.plate]):
+        sdir = (plate_dir / sub) if is_384 else plate_dir
+        sources[sub] = {
+            "dir": sdir,
+            "dedup": load_tsv_by_well(
+                sdir / "dedup" / "dedup_summary.tsv",
+                {"unique_reads": "unique_reads", "duplicate_reads": "duplicate_reads",
+                 "dedup_rate": "dedup_rate"}),
+            "dimers": load_tsv_by_well(
+                sdir / "filtered" / "adapter_filter_summary.tsv",
+                {"dimer_rate": "dimer_rate", "kept_pairs": "kept_pairs"}),
+            "demux": load_demux_totals(sdir / "demux" / "demux_stats.json"),
+        }
 
-    well_data = {}
+    cell_meta, cell_wells, cell_objects = load_cellenone(args.cellenone_dir)
+    if args.cellenone_dir:
+        logger.info("CellenONE: %d well record(s), %d with objects",
+                    len(cell_wells), len(cell_objects))
+
+    wells_payload = []
     n_profiles = 0
     n_hist = 0
+    n_cell_images = 0
     status_counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "UNKNOWN": 0}
-    for w in wells:
-        sam = parse_samtools_stats(plate_dir / "bam" / f"{w}.stats.txt")
+    for e in layout:
+        wid, sub, w = e["id"], e["subplate"], e["well"]
+        src = sources[sub]
+        sam = parse_samtools_stats(src["dir"] / "bam" / f"{w}.stats.txt")
         metrics = dict(sam)
-        if w in dedup:
-            metrics["unique_reads"] = dedup[w].get("unique_reads")
-            metrics["duplicate_reads"] = dedup[w].get("duplicate_reads")
-            metrics["dedup_rate"] = dedup[w].get("dedup_rate")
-        if w in dimers:
-            metrics["dimer_rate"] = dimers[w].get("dimer_rate")
-            metrics["kept_pairs"] = dimers[w].get("kept_pairs")
-        if w in demux_totals:
-            metrics["demux_reads"] = demux_totals[w]
+        # The alignment rate has to come from the RAW (pre-dedup) BAM. umi_tools drops
+        # unmapped reads, so in the dedup BAM `reads mapped` == `raw total sequences`
+        # and mapped/total is 100.00% for every well by construction — which is what
+        # this field used to report. The real figure is ~98.5%.
+        raw = parse_samtools_stats(src["dir"] / "raw_bam" / f"{w}.stats.txt")
+        metrics["mapping_rate"] = raw.get("mapping_rate")
+        metrics["aligned_reads"] = raw.get("mapped_reads")
+        if w in src["dedup"]:
+            metrics["unique_reads"] = src["dedup"][w].get("unique_reads")
+            metrics["duplicate_reads"] = src["dedup"][w].get("duplicate_reads")
+            metrics["dedup_rate"] = src["dedup"][w].get("dedup_rate")
+        if w in src["dimers"]:
+            metrics["dimer_rate"] = src["dimers"][w].get("dimer_rate")
+            metrics["kept_pairs"] = src["dimers"][w].get("kept_pairs")
+        if w in src["demux"]:
+            metrics["demux_reads"] = src["demux"][w]
 
         # UMI dedup retention (diagnostic only): unique / (unique + duplicate)
         uniq = metrics.get("unique_reads")
@@ -331,6 +675,8 @@ def main():
             metrics["umi_retention"] = round(uniq / (uniq + dup) * 100, 2)
 
         # Read-count-only gating on usable_reads = mapped reads in the dedup BAM.
+        # NOTE: the CellenONE image call is DELIBERATELY not an input here — see the
+        # comment on compute_status().
         usable_reads = metrics.get("mapped_reads")
         metrics["usable_reads"] = usable_reads
         auto_status, default_decision, default_reason, flags = compute_status(
@@ -338,531 +684,415 @@ def main():
         status_counts[auto_status] = status_counts.get(auto_status, 0) + 1
 
         # plots (prefer SVG → PNG). In cn-mode only included wells have second-pass plots.
-        is_included = (kind != "cn") or (w in included_set)
-        profile_uri = embed_well_plot(plots_dir, w, "profile") if is_included else ""
-        hist_uri = embed_well_plot(plots_dir, w, "histogram") if is_included else ""
+        is_included = (kind != "cn") or (wid in included_set)
+        profile_uri = assets.ref(well_plot_path(plots_dir, wid, "profile")) if is_included else ""
+        hist_uri = assets.ref(well_plot_path(plots_dir, wid, "histogram")) if is_included else ""
         if profile_uri:
             n_profiles += 1
         if hist_uri:
             n_hist += 1
-        r, c = geom["pos"][w]
-        well_data[w] = {
+
+        # CellenONE evidence. DISPLAY ONLY — see the note on compute_status().
+        # The counts come straight from render_cellenone_images.py, which derives them
+        # and the call from the same object list, so they agree by construction (spec §4).
+        cell_images = {}
+        call, n_obj, n_iso, right_x, right_dia = "NO_IMAGE", None, None, None, None
+        cell_dia = cell_elong = cell_circ = cell_int = None
+        flu_int = {}
+        if wid in cell_wells:
+            cw = cell_wells[wid]
+            for name in (cw.get("image_paths") or "").split(";"):
+                if not name:
+                    continue
+                channel = name.rsplit("_", 1)[-1].rsplit(".", 1)[0]
+                if channel not in ("merge", "trans", "blue", "orange", "red"):
+                    continue
+                uri = assets.ref(Path(args.cellenone_dir) / "images" / name)
+                if uri:
+                    cell_images[channel] = uri
+            if cell_images:
+                n_cell_images += 1
+            call = cw.get("image_call") or "NO_IMAGE"
+            n_obj = as_number(cw.get("n_objects"), int)
+            n_iso = as_number(cw.get("n_in_iso_window"), int)
+            right_x = as_number(cw.get("rightmost_x"), float)
+            right_dia = as_number(cw.get("rightmost_diameter_um"), float)
+            # CellenONE's own measurements of the isolated cell (secondary column).
+            cell_dia = as_number(cw.get("diameter_um"), float)
+            cell_elong = as_number(cw.get("elongation"), float)
+            cell_circ = as_number(cw.get("circularity"), float)
+            cell_int = as_number(cw.get("intensity"), float)
+            for _ch in ("blue", "orange", "red"):
+                _v = as_number(cw.get(f"{_ch}_intensity"), float)
+                # 0 means the channel recorded nothing for this cell — report it as
+                # absent rather than as a measured zero. (Red was not a configured
+                # channel on this run at all, so it is 0 for every well that has a
+                # stray Red frame.)
+                if _v:
+                    flu_int[_ch] = _v
+
+        r, c = geom["pos"][wid]
+        wells_payload.append({
+            "n": len(wells_payload),
+            "id": e.get("sample_id") or f"{args.plate}_{w}",   # the CSV key
             "well": w,
-            "sample_id": f"{args.plate}_{w}",
+            "subplate": sub if is_384 else "",
+            "pos": e.get("pos384", "") if is_384 else "",
             "row": r,
             "col": c,
-            "metrics": metrics,
-            "status": auto_status,
-            "default_decision": default_decision,
-            "default_reason": default_reason,
-            "flags": flags,
+            "status": GATE_STATUS[auto_status],
+            "reads": usable_reads,
             "included": is_included,
-            "plot": profile_uri,
-            "histogram": hist_uri,
-        }
+            "call": call,
+            "nObj": n_obj,
+            "nIso": n_iso,
+            "rightmost_x": right_x,
+            "rightmost_dia": right_dia,
+            # Shape/intensity of the cell CellenONE isolated. Secondary detail — the
+            # panel keeps these behind a disclosure, so they never compete with the
+            # four primary image facts above.
+            "cell_dia": cell_dia,
+            "cell_elong": cell_elong,
+            "cell_circ": cell_circ,
+            "cell_int": cell_int,
+            # Per-channel fluorescence intensity of the isolated cell, keyed by the
+            # instrument's channel name. Shown against whichever channel is on screen.
+            "flu": flu_int or None,
+            "flags": flags,
+            # An absent metric is null, never 0: the UI renders "–" for null and would
+            # otherwise claim a real measurement of zero.
+            "metrics": {k: metrics.get(k) for k in (
+                "reads", "demux_reads", "unique_reads", "mapping_rate",
+                "dedup_rate", "umi_retention", "gc_content", "dimer_rate",
+                "average_quality")},
+            "images": cell_images or None,
+            "profile_src": profile_uri or None,
+            "hist_src": hist_uri or None,
+        })
 
-    logger.info("Embedded %d/%d profile PNGs, %d/%d histogram PNGs",
-                n_profiles, len(wells), n_hist, len(wells))
+    logger.info("Resolved %d/%d profile plots, %d/%d histogram plots",
+                n_profiles, len(ids), n_hist, len(ids))
+    if args.cellenone_dir:
+        logger.info("Cell images for %d/%d wells", n_cell_images, len(ids))
     logger.info("Auto-status: PASS=%d WARN=%d FAIL=%d UNKNOWN=%d",
                 status_counts["PASS"], status_counts["WARN"],
                 status_counts["FAIL"], status_counts["UNKNOWN"])
 
     heatmap_uri = ""
     if kind == "cn" and args.heatmap:
-        heatmap_uri = embed_png(Path(args.heatmap))
+        heatmap_uri = assets.ref(Path(args.heatmap))
         if heatmap_uri:
-            logger.info("Embedded genome heatmap from %s", args.heatmap)
+            logger.info("Genome heatmap: %s", args.heatmap)
 
     if args.title:
         title = args.title
-    elif kind == "cn":
-        title = "Final CN Review"
     else:
-        title = "QC Review"
+        title = (f"{args.plate} final copy number" if kind == "cn"
+                 else f"{args.plate} QC review")
+
+    # MultiQC lives per subplate, but the header has ONE link slot, so 384 points at SL1
+    # and says how many there are; the other three sit beside it in the same directory.
+    if is_384:
+        multiqc_href = f"../{subplates[0]}/multiqc/multiqc_report.html"
+        multiqc_label = f"{len(subplates)} subplates"
+    else:
+        multiqc_href = "../multiqc/multiqc_report.html"
+        multiqc_label = args.plate
+
+    # The gate labels and the two markers on the usable-reads bar come from the
+    # configured cutoffs, not from literals, so the report cannot claim a gate it did
+    # not apply. At the defaults (50k/100k) this reproduces the prototype exactly.
+    warn_label, pass_label = read_label(warn_cutoff), read_label(pass_cutoff)
+    if pass_cutoff > USABLE_SCALE:
+        logger.warning("usable_reads_pass_cutoff (%d) is off the fixed 0-%s bar scale; "
+                       "its marker is pinned at 100%%", pass_cutoff, read_label(USABLE_SCALE))
+
+    subplate_tabs = "".join(
+        f'<button type="button" class="tab" data-sub="{html.escape(s, quote=True)}">SL{i + 1}</button>'
+        for i, s in enumerate(subplates)
+    )
 
     decisions_path = args.decisions_path or str(Path(args.plate_dir) / "qc_decisions.csv")
-    app = {
+    bins_label = read_label_bp((cfg.get("aneufinder", {}) or {}).get("binsize"))
+
+    # The data contract — design/handoff/README.md § Data contract. Everything the page does
+    # with it (grid, decisions, autosave, CSV, keyboard) belongs to assets/qc_review.js.
+    payload = {
         "plate": args.plate,
-        "kind": kind,
-        "title": title,
-        "decisions": DECISIONS,
-        "reasons": REASONS,
-        "plate_dir": args.plate_dir,
+        "size": 384 if is_384 else 96,
+        "mode": kind,
+        "gate": {"warn": warn_cutoff, "pass": pass_cutoff},
+        "bins_label": bins_label,
         "decisions_path": decisions_path,
         "decisions_dir": str(Path(decisions_path).parent),
-        "cutoffs": {"pass": pass_cutoff, "warn": warn_cutoff},
-        "grid": {"rows": geom["rows"], "cols": geom["cols"], "mode": geom["mode"]},
-        "wells_order": wells,
-        "wells": well_data,
         "heatmap": heatmap_uri,
+        "wells": wells_payload,
+    }
+    tokens = {
+        "__TITLE__": html.escape(title),
+        "__WELL_COUNT__": str(len(wells_payload)),
+        "__GATE_SUMMARY__": f"&#8805;{warn_label} warn &#183; &#8805;{pass_label} pass",
+        "__PASS_NOTE__": f"&#8805; {pass_label} usable reads",
+        "__REVIEW_NOTE__": f"{warn_label} &#8211; {pass_label} reads",
+        "__FAIL_NOTE__": f"&lt; {warn_label} reads",
+        "__WARN_PCT__": bar_pct(warn_cutoff),
+        "__PASS_PCT__": bar_pct(pass_cutoff),
+        "__WARN_TICK__": warn_label,
+        "__PASS_TICK__": pass_label,
+        "__MULTIQC_HREF__": html.escape(multiqc_href, quote=True),
+        "__MULTIQC_LABEL__": html.escape(multiqc_label),
+        "__DECISIONS_PATH__": html.escape(decisions_path),
+        "__SUBPLATE_TABS__": subplate_tabs,
     }
 
-    html = build_html(app)
+    page = render(HTML_TEMPLATE, payload, tokens)
     out_name = args.out_name or ("cn_review.html" if kind == "cn" else "review.html")
     out_html = outdir / out_name
-    out_html.write_text(html, encoding="utf-8")
-    logger.info("Wrote %s", out_html)
+    out_html.write_text(page, encoding="utf-8")
+    logger.info("Wrote %s (%.1f MB HTML; %s)",
+                out_html, out_html.stat().st_size / 1e6, assets.summary())
 
 
 # ---------------------------------------------------------------------------
-# Self-contained HTML/CSS/JS template. __DATA_BLOB__ is replaced with JSON.
+# The page itself. Markup from design/handoff/qc_review_template.html; the CSS and JS are
+# read verbatim from assets/ and pasted in, so the report is one self-contained file.
+# Substitution is plain str.replace — %-formatting and .format() both choke on the CSS.
 # ---------------------------------------------------------------------------
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
+<!-- QC review report — generated by workflow/scripts/reporting/generate_qc_review.py.
+     Markup: design/handoff/qc_review_template.html. Placeholders are upper-snake tokens between
+     double underscores, substituted with str.replace (NOT %-formatting or .format():
+     the CSS is full of braces). render() fails the build on an unknown one.
+     __QC_CSS__ / __QC_JS__ are the verbatim contents of assets/qc_review.{css,js} next to
+     this script, so the report stays one self-contained file that opens from file://. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QC Review</title>
+<title>__TITLE__</title>
 <style>
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-         color:#1a1a1a; background:#f4f5f7; }
-  header { background:#fff; border-bottom:1px solid #ddd; padding:12px 20px;
-           display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
-  header h1 { font-size:18px; margin:0; }
-  header .meta { color:#555; font-size:13px; }
-  header a { color:#1565c0; }
-  .layout { display:flex; gap:12px; padding:12px; align-items:flex-start; }
-  .left { flex:0 0 auto; max-width:470px; }   /* ~ plate-map width; hint/legend wrap, no dead space */
-  .right { flex:1 1 auto; min-width:0; }
-  .panel { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px; }
-  table.grid { border-collapse:collapse; }
-  table.grid th { font-size:11px; color:#666; font-weight:600; padding:2px 4px; text-align:center; }
-  table.grid td { padding:2px; }
-  .cell { position:relative; width:30px; height:24px; border-radius:3px; border:2px solid transparent;
-          color:#fff; font-size:9px; font-weight:600; cursor:pointer; display:flex;
-          flex-direction:column; align-items:center; justify-content:center; line-height:1.05;
-          user-select:none; }
-  .cell:hover { outline:1px solid #333; }
-  .cell.sel { border-color:#111; box-shadow:0 0 0 2px #111 inset; }
-  .cell.manual::after { content:""; position:absolute; top:2px; right:2px; width:6px; height:6px;
-                        border-radius:50%; background:#fff; box-shadow:0 0 0 1px #111; }
-  .cell .dec { font-size:7px; letter-spacing:0.2px; opacity:0.95; }
-  .legend { display:flex; gap:14px; margin-top:10px; font-size:12px; flex-wrap:wrap; }
-  .legend span { display:inline-flex; align-items:center; gap:5px; }
-  .swatch { width:13px; height:13px; border-radius:3px; display:inline-block; }
-  .dot { width:7px; height:7px; border-radius:50%; background:#fff; box-shadow:0 0 0 1px #111; display:inline-block; }
-  .kv { width:100%; border-collapse:collapse; font-size:13px; margin-bottom:12px; }
-  .kv td { padding:3px 8px; border-bottom:1px solid #eee; }
-  .kv td.k { color:#666; width:46%; }
-  .kv tr.gate td { background:#f0f7ff; font-weight:600; }
-  .kv .diag { color:#888; font-size:11px; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:10px; color:#fff; font-size:12px; font-weight:600; }
-  .flags { color:#b71c1c; font-size:12px; }
-  .statebadge { display:inline-block; padding:2px 9px; border-radius:10px; font-size:12px; font-weight:600; margin-left:8px; }
-  .statebadge.auto { background:#eee; color:#555; }
-  .statebadge.saved { background:#1565c0; color:#fff; }
-  .ctl { margin:14px 0; }
-  .ctl > .lbl { font-size:12px; color:#555; margin-bottom:5px; }
-  .btnrow { display:flex; gap:8px; flex-wrap:wrap; }
-  .decbtn { font:inherit; font-weight:600; padding:7px 16px; border:2px solid #bbb; background:#fff;
-            color:#333; border-radius:5px; cursor:pointer; }
-  .decbtn.active { color:#fff; border-color:transparent; }
-  .reasonbtn { font:inherit; font-size:12px; padding:5px 11px; border:1px solid #bbb; background:#fff;
-               color:#444; border-radius:14px; cursor:pointer; }
-  .reasonbtn.active { background:#1565c0; color:#fff; border-color:#1565c0; }
-  textarea { font:inherit; padding:6px 8px; border:1px solid #bbb; border-radius:4px; width:100%; min-height:42px; }
-  .savebtn { font:inherit; font-weight:600; padding:8px 18px; border:1px solid #2e7d32; background:#2e7d32;
-             color:#fff; border-radius:5px; cursor:pointer; margin-top:10px; }
-  .plots { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
-  .plots.stack { flex-direction:column; flex-wrap:nowrap; }
-  .plotbox { flex:1 1 460px; min-width:320px; border:1px solid #eee; border-radius:4px; background:#fafafa; }
-  .plots.stack .plotbox { flex:1 1 auto; width:100%; max-width:1200px; }
-  .plotbox.narrow { max-width:820px; }
-  .plotbox .cap { font-size:12px; color:#666; padding:4px 8px; border-bottom:1px solid #eee; }
-  .plotbox img { width:100%; display:block; }
-  .cell.excl { opacity:0.5; }
-  .noplot { padding:20px; text-align:center; color:#999; font-style:italic; }
-  .toolbar { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px 14px; margin:0 16px 16px; }
-  .toolbar button { font:inherit; padding:7px 14px; margin-right:10px; border:1px solid #1565c0;
-                    background:#1565c0; color:#fff; border-radius:4px; cursor:pointer; }
-  .toolbar button.secondary { background:#fff; color:#1565c0; }
-  .toolbar code { background:#eef; padding:1px 5px; border-radius:3px; }
-  .hint { font-size:12px; color:#555; margin-top:8px; line-height:1.5; }
-  .progress { font-size:12px; color:#444; margin-left:auto; }
-  .mapwrap { display:flex; flex-direction:column; gap:12px; align-items:flex-start; }
-  .statcol { display:flex; flex-direction:row; gap:10px; flex-wrap:wrap; }
-  .statcard { border:1px solid #ddd; border-radius:8px; padding:12px 18px; min-width:150px;
-              text-align:center; background:#fafafa; }
-  .statcard .lbl { font-size:12px; color:#666; text-transform:uppercase; letter-spacing:.5px; }
-  .statcard .pct { font-size:34px; font-weight:800; line-height:1.05; margin-top:6px; }
-  .statcard .cnt { font-size:13px; color:#555; margin-top:2px; }
-  .statcard.pass .pct { color:#2e7d32; }
-  .statcard.review .pct { color:#1565c0; }
+__QC_CSS__
 </style>
 </head>
 <body>
-<script>const APP = __DATA_BLOB__;</script>
-<header>
-  <h1><span id="reportTitle">QC Review</span> &mdash; <span id="plateName"></span></h1>
-  <span class="meta"><span id="wellCount"></span> wells &middot; grid: <span id="gridMode"></span></span>
-  <span class="meta">gating: usable_reads &ge; <span id="cutPass"></span> = PASS, &ge; <span id="cutWarn"></span> = WARN</span>
-  <span class="meta"><a id="multiqcLink" href="../multiqc/multiqc_report.html" target="_blank" rel="noopener">Open MultiQC report &#8599;</a></span>
-  <span class="progress" id="progress"></span>
-</header>
+<div class="page">
 
-<div class="panel" id="heatmapPanel" style="margin:0 12px 12px; display:none">
-  <h2 style="margin:0 0 10px; font-size:16px">Genome-wide copy-number heatmap (second pass)</h2>
-  <img id="heatmapImg" style="width:100%; border:1px solid #eee; border-radius:4px" alt="genome heatmap">
-</div>
+  <header class="hdr">
+    <h1>__TITLE__</h1>
+    <div class="hdr-facts">
+      <div><div class="micro">Wells</div><div class="v">__WELL_COUNT__</div></div>
+      <div><div class="micro">Read gate</div><div class="v">__GATE_SUMMARY__</div></div>
+      <div><div class="micro">MultiQC</div><div class="v"><a href="__MULTIQC_HREF__">__MULTIQC_LABEL__ &#8599;</a></div></div>
+      <div><div class="micro">Needing you</div><div class="v mono" id="progress">&#8211;</div></div>
+    </div>
+    <input class="search" id="search" placeholder="well, position, sample id&#8230;">
+    <!-- cn only; qc_review.js unhides it and hides the search box -->
+    <div class="hdr-cn" id="hdr-cn" hidden>
+      <div class="micro">Cells in second pass</div>
+      <div class="n" id="included-count">&#8211;</div>
+    </div>
+  </header>
 
-<div class="layout">
-  <div class="left panel">
-    <div class="mapwrap">
-      <div id="plateMap"></div>
-      <div class="statcol" id="statcol">
-        <div class="statcard pass">
-          <div class="lbl">Pass rate</div>
-          <div class="pct"><span id="passPct">0</span>%</div>
-          <div class="cnt"><span id="passCount">0</span> / <span id="passTotal">0</span> wells</div>
+  <!-- ============ cn only: genome-wide copy number ============ -->
+  <section class="bp cnmap" id="cnmap" hidden>
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+    <div class="cnmap-head">
+      <h2>Genome-wide copy number &#183; <span id="cn-cells">&#8211;</span> cells</h2>
+      <span class="note">natural size &#183; scroll horizontally</span>
+    </div>
+    <div class="cnmap-scroll"><img id="cn-heatmap" alt="genome-wide copy-number heatmap"></div>
+    <div class="cnmap-legend">
+      <span>copy number</span>
+      <span><i style="background:#8c2b22"></i>0</span>
+      <span><i style="background:#d5928a"></i>1</span>
+      <span><i style="background:#e8e6e2"></i>2</span>
+      <span><i style="background:#a3c1dc"></i>3</span>
+      <span><i style="background:#4a7fae"></i>4</span>
+      <span><i style="background:#22496f"></i>5+</span>
+    </div>
+  </section>
+
+  <div class="cols">
+
+    <!-- ============ left: plate map ============ -->
+    <div class="col-map">
+      <div class="bp map-panel">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+
+        <div class="map-head">
+          <h2>Plate map</h2>
+          <div id="subtabs" style="display:flex;gap:8px">
+            <button type="button" class="tab on">ALL</button>
+            __SUBPLATE_TABS__
+          </div>
         </div>
-        <div class="statcard review">
-          <div class="lbl">Review rate</div>
-          <div class="pct"><span id="revPct">0</span>%</div>
-          <div class="cnt"><span id="revCount">0</span> / <span id="revTotal">0</span> wells</div>
+
+        <div class="stats">
+          <div class="stat stat-pass" id="stat-pass">
+            <div class="top"></div><div class="micro">Pass rate</div>
+            <div class="row"><span class="big">&#8211;</span><span class="sub"></span></div>
+            <div class="track"><i></i></div>
+            <div class="note">__PASS_NOTE__</div>
+          </div>
+          <div class="stat stat-review" id="stat-review">
+            <div class="top"></div><div class="micro">Review rate</div>
+            <div class="row"><span class="big">&#8211;</span><span class="sub"></span></div>
+            <div class="track"><i></i></div>
+            <div class="note">__REVIEW_NOTE__</div>
+          </div>
+          <div class="stat stat-fail" id="stat-fail">
+            <div class="top"></div><div class="micro">Fail rate</div>
+            <div class="row"><span class="big">&#8211;</span><span class="sub"></span></div>
+            <div class="track"><i></i></div>
+            <div class="note">__FAIL_NOTE__</div>
+          </div>
+        </div>
+
+        <div class="grid-cols"><div style="flex:0 0 18px"></div><div class="colhdr" id="colhdr"></div></div>
+        <div class="grid-wrap">
+          <div class="rowhdr" id="rowhdr"></div>
+          <div class="wells" id="wells"></div>
+        </div>
+
+        <div class="hoverline mono" id="hoverline"></div>
+
+        <div class="legend">
+          <span><i style="background:#2e7d4f"></i>PASS</span>
+          <span><i style="background:#d9e7f7;border:1px solid #2f6cad"></i>REVIEW</span>
+          <span><i style="background:#a8711c"></i>REPEAT</span>
+          <span><i style="background:#f7dfdc;border:1px solid #b23a2f"></i>EXCLUDE</span>
+          <span><i style="border:1px dotted rgba(29,31,32,.45)"></i>decided &#9632; / seen &#9633;</span>
         </div>
       </div>
-    </div>
-    <div class="legend" id="legend">
-      <span><span class="swatch" style="background:#2e7d32"></span>PASS</span>
-      <span><span class="swatch" style="background:#c62828"></span>EXCLUDE</span>
-      <span><span class="swatch" style="background:#1565c0"></span>REVIEW</span>
-      <span><span class="swatch" style="background:#ef6c00"></span>REPEAT</span>
-      <span><span class="dot"></span>manually saved</span>
-    </div>
-    <div class="hint" id="mapHint">Cell colour = current decision (auto-default until you Save). The detail
-      panel shows the automated read-count status. A dot marks wells you have saved.</div>
-  </div>
 
-  <div class="right panel" id="detail">
-    <p style="color:#888">Select a well from the plate map to review it.</p>
+      <div class="export" id="export">
+        <span class="micro" style="color:rgba(231,231,234,.55)">Export</span>
+        <span class="sum" id="export-summary"></span>
+        <button type="button" class="primary" id="copy-cmd">COPY SAVE COMMAND</button>
+        <button type="button" class="ghost" id="copy-csv">COPY CSV</button>
+        <button type="button" class="ghost" id="download-csv">DOWNLOAD CSV</button>
+        <span class="flash" id="flash"></span>
+        <span class="path">__DECISIONS_PATH__</span>
+      </div>
+    </div>
+
+    <!-- ============ right: inspector ============ -->
+    <div class="col-insp">
+      <div class="bp insp">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+
+        <div class="insp-head">
+          <div>
+            <h2 id="well-id">&#8211;</h2>
+            <div class="chips">
+              <span class="chip" id="chip-decision"></span>
+              <span class="chip" id="chip-source"></span>
+              <span class="chip c-pos" id="chip-pos"></span>
+            </div>
+          </div>
+          <div class="dec" id="dec">
+            <div class="dec-grid" id="dec-grid">
+              <button type="button" class="dec-btn" data-dec="PASS"><i class="s-PASS"></i><span>PASS</span></button>
+              <button type="button" class="dec-btn" data-dec="EXCLUDE"><i class="s-EXCLUDE"></i><span>EXCLUDE</span></button>
+              <button type="button" class="dec-btn" data-dec="REVIEW"><i class="s-REVIEW"></i><span>REVIEW</span></button>
+              <button type="button" class="dec-btn" data-dec="REPEAT"><i class="s-REPEAT"></i><span>REPEAT</span></button>
+            </div>
+            <div class="dec-save">
+              <button type="button" class="ok" id="confirm" title="Save this decision and open the next well">&#10003;</button>
+              <button type="button" class="caret" id="caret" title="Reasons and notes">&#9660;</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="drawer" id="drawer" hidden>
+          <div class="micro">Reasons</div>
+          <div class="rgroups" id="rgroups"></div>
+          <textarea class="notes" id="notes" placeholder="Notes (optional) &#8212; saved as you type"></textarea>
+        </div>
+
+        <div class="sect"><h3>Diagnostics</h3><span class="rule"></span></div>
+        <div class="usable">
+          <div class="row">
+            <span class="micro">Usable reads</span>
+            <span class="v" id="usable-val">&#8211;</span>
+          </div>
+          <div class="track">
+            <i class="fill" id="usable-fill"></i>
+            <i class="tri tri-warn" style="left:__WARN_PCT__"></i>
+            <i class="tri tri-pass" style="left:__PASS_PCT__"></i>
+          </div>
+          <div class="ticks">
+            <span class="t-warn" style="left:__WARN_PCT__">__WARN_TICK__</span>
+            <span class="t-pass" style="left:__PASS_PCT__">__PASS_TICK__</span>
+          </div>
+        </div>
+        <div class="diag" id="diag"></div>
+
+        <div class="sect"><h3>Evidence</h3><span class="rule"></span></div>
+
+        <div class="img-row">
+          <div class="img-panel">
+            <div class="img-head">
+              <span class="micro">CellenONE image</span>
+              <div class="seg" id="seg">
+                <button type="button" data-ch="merge" class="on">MERGE</button>
+                <button type="button" data-ch="trans">TRANSMISSION</button>
+              </div>
+            </div>
+            <!-- No .vline/.vlbl overlay: render_cellenone_images.py already draws the
+                 isolation and ejection lines into the image at the run's real x, and a
+                 second pair at fixed 38%/66% would contradict them. -->
+            <div class="plate" id="plate">
+              <img id="plate-img" alt="CellenONE image" hidden>
+              <span class="nozzle">nozzle &#8592;</span>
+              <span class="cap" id="plate-cap"></span>
+            </div>
+          </div>
+          <div class="img-metrics" id="img-metrics">
+            <div class="hd micro">
+              <span>Metrics</span>
+              <!-- Reveals the isolated-cell shape column. Auto-open on a wide window
+                   (see the media query), so the control only matters when space is
+                   tight. -->
+              <button type="button" class="more" id="img-more"
+                      title="Isolated-cell shape (→)" aria-expanded="false">&#9654;</button>
+            </div>
+            <div class="img-metrics-cols">
+              <div id="img-metrics-body"></div>
+              <div id="img-metrics-more" class="more-col" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <figure>
+          <div class="frame">
+            <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:7px">
+              <span class="micro">Copy-number profile</span>
+              <span class="mono" style="font-size:12px;color:rgba(29,31,32,.4)" id="profile-note"></span>
+            </div>
+            <img id="profile-img" alt="copy-number profile" hidden>
+            <div class="mono" id="profile-placeholder" style="font-size:12px;color:rgba(29,31,32,.45)" hidden></div>
+            <div class="axis" id="profile-axis"></div>
+          </div>
+        </figure>
+
+        <figure>
+          <div class="frame">
+            <div class="micro" style="margin-bottom:6px">Bin read counts</div>
+            <img id="hist-img" alt="bin read counts" hidden>
+            <div class="mono" id="hist-placeholder" style="font-size:12px;color:rgba(29,31,32,.45)" hidden></div>
+          </div>
+        </figure>
+
+      </div>
+    </div>
   </div>
 </div>
 
-<div class="toolbar" id="toolbar">
-  <button id="btnCopyCmd">Copy terminal save command</button>
-  <button id="btnCopy" class="secondary">Copy CSV only</button>
-  <button id="btnDownload" class="secondary">Download qc_decisions.csv</button>
-  <span class="hint" id="copyStatus"></span>
-  <div class="hint">
-    <b>Recommended:</b> click <b>Copy terminal save command</b>, then paste it into a terminal
-    on the cluster &mdash; it writes your decisions straight to
-    <code id="decPath"></code>.
-    <b>⚠ This overwrites any existing file at that path</b> (the command prints a warning if one exists).<br>
-    Then run <code>MODE=post_review</code> (validate &rarr; second-pass AneuFinder &rarr; cn_review.html).
-    The browser cannot write into the project; the command (or the downloaded file) is how the CSV gets saved.
-  </div>
-</div>
-
+<script>window.QC = __QC_JSON__;</script>
 <script>
-(function () {
-  var DEC_COLOR = { PASS:"#2e7d32", EXCLUDE:"#c62828", REVIEW:"#1565c0", REPEAT:"#ef6c00" };
-  var ST_COLOR  = { PASS:"#2e7d32", WARN:"#f9a825", FAIL:"#c62828", UNKNOWN:"#9e9e9e" };
-
-  var decisions = {};   // well -> {decision, reasons:[], notes}
-  var manual = {};      // well -> bool (user has Saved this well)
-  var selected = null;
-
-  function initDecisions() {
-    APP.wells_order.forEach(function (w) {
-      var d = APP.wells[w];
-      var r = d.default_reason ? [d.default_reason] : [];
-      decisions[w] = { decision: d.default_decision || "REVIEW", reasons: r, notes: "" };
-      manual[w] = false;
-    });
-  }
-
-  function fmt(v, suffix) {
-    if (v === null || v === undefined || v === "") return "&ndash;";
-    if (typeof v === "number") {
-      var s = Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
-      return s + (suffix || "");
-    }
-    return v;
-  }
-
-  function buildMap() {
-    var g = APP.grid;
-    var html = '<table class="grid"><thead><tr><th></th>';
-    for (var c = 0; c < g.cols; c++) html += '<th>' + (c + 1) + '</th>';
-    html += '</tr></thead><tbody>';
-    var byPos = {};
-    APP.wells_order.forEach(function (w) { var d = APP.wells[w]; byPos[d.row + ":" + d.col] = w; });
-    for (var r = 0; r < g.rows; r++) {
-      html += '<tr><th>' + String.fromCharCode(65 + r) + '</th>';
-      for (var c2 = 0; c2 < g.cols; c2++) {
-        var w = byPos[r + ":" + c2];
-        if (!w) { html += '<td></td>'; continue; }
-        html += '<td><div class="cell" data-well="' + w + '" id="cell-' + w + '">' +
-                '<span>' + w + '</span><span class="dec" id="dec-' + w + '"></span></div></td>';
-      }
-      html += '</tr>';
-    }
-    html += '</tbody></table>';
-    document.getElementById("plateMap").innerHTML = html;
-    document.querySelectorAll(".cell").forEach(function (el) {
-      el.addEventListener("click", function () { select(el.getAttribute("data-well")); });
-    });
-    APP.wells_order.forEach(refreshCell);
-  }
-
-  function refreshCell(w) {
-    var cell = document.getElementById("cell-" + w);
-    if (!cell) return;
-    if (APP.kind === 'cn') {
-      var dd = APP.wells[w];
-      // included (PASS) wells keep their original auto-status colour; excluded -> grey
-      cell.style.background = dd.included ? (ST_COLOR[dd.status] || "#9e9e9e") : "#d6d6d6";
-      if (dd.included) cell.classList.remove("excl"); else cell.classList.add("excl");
-      return;
-    }
-    var dec = decisions[w];
-    cell.style.background = DEC_COLOR[dec.decision] || "#9e9e9e";
-    var lbl = document.getElementById("dec-" + w);
-    if (lbl) lbl.textContent = dec.decision;
-    if (manual[w]) cell.classList.add("manual"); else cell.classList.remove("manual");
-  }
-
-  function metricRow(k, v, cls) {
-    return '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td class="k">' + k + '</td><td>' + v + '</td></tr>';
-  }
-
-  function plotBox(cap, uri, well, what, cls) {
-    var c = "plotbox" + (cls ? " " + cls : "");
-    if (uri) return '<div class="' + c + '"><div class="cap">' + cap + '</div><img src="' + uri + '" alt="' + what + ' ' + well + '"></div>';
-    return '<div class="' + c + '"><div class="cap">' + cap + '</div><div class="noplot">No ' + what + ' for ' + well + '</div></div>';
-  }
-
-  function select(w) {
-    selected = w;
-    document.querySelectorAll(".cell").forEach(function (el) { el.classList.remove("sel"); });
-    var cell = document.getElementById("cell-" + w);
-    if (cell) cell.classList.add("sel");
-
-    var d = APP.wells[w], m = d.metrics || {}, dec = decisions[w];
-    var stColor = ST_COLOR[d.status] || "#9e9e9e";
-
-    var html = '';
-    html += '<h2 style="margin:0 0 10px">' + d.sample_id;
-    if (APP.kind === 'review') {
-      html += '<span class="statebadge ' + (manual[w] ? 'saved' : 'auto') + '" id="stateBadge">' +
-              (manual[w] ? 'saved (manual)' : 'auto-default') + '</span>';
-    }
-    html += '</h2>';
-
-    html += '<table class="kv">';
-    html += metricRow("Automated status",
-      '<span class="badge" style="background:' + stColor + '">' + d.status + '</span>' +
-      (d.flags && d.flags.length ? ' <span class="flags">' + d.flags.join(", ") + '</span>' : ''));
-    html += metricRow("Usable reads (mapped, dedup BAM)", fmt(m.usable_reads), "gate");
-    html += metricRow("Total reads (dedup BAM)", fmt(m.reads));
-    html += metricRow("Mapping rate", fmt(m.mapping_rate, "%"));
-    html += metricRow("UMI-tools duplicate rate <span class=\"diag\">(diagnostic, not gated)</span>", fmt(m.dedup_rate, "%"));
-    html += metricRow("UMI dedup retention <span class=\"diag\">(diagnostic)</span>", fmt(m.umi_retention, "%"));
-    html += metricRow("Adapter-dimer rate", fmt(m.dimer_rate, "%"));
-    html += metricRow("Unique reads", fmt(m.unique_reads));
-    html += metricRow("Demux reads", fmt(m.demux_reads));
-    html += metricRow("Avg quality", fmt(m.average_quality));
-    html += '</table>';
-
-    if (APP.kind === 'review') {
-      // decision buttons
-      html += '<div class="ctl"><div class="lbl">Decision</div><div class="btnrow" id="decBtns">';
-      APP.decisions.forEach(function (x) {
-        var on = x === dec.decision;
-        html += '<button type="button" class="decbtn' + (on ? ' active' : '') + '" data-dec="' + x +
-                '" style="' + (on ? 'background:' + DEC_COLOR[x] + ';' : '') + '">' + x + '</button>';
-      });
-      html += '</div></div>';
-      // reason multi-select buttons
-      html += '<div class="ctl"><div class="lbl">Reasons (select any)</div><div class="btnrow" id="reasonBtns">';
-      APP.reasons.forEach(function (x) {
-        var on = dec.reasons.indexOf(x) !== -1;
-        html += '<button type="button" class="reasonbtn' + (on ? ' active' : '') + '" data-reason="' + x + '">' + x + '</button>';
-      });
-      html += '</div></div>';
-      // notes + save
-      html += '<div class="ctl"><div class="lbl">Notes</div><textarea id="txtNotes">' + (dec.notes || '') + '</textarea></div>';
-      html += '<button type="button" class="savebtn" id="btnSave">Save decision</button>';
-    }
-
-    // plots: review stacks profile/histogram vertically; cn keeps them side-by-side
-    html += '<div class="plots' + (APP.kind === 'review' ? ' stack' : '') + '">';
-    if (APP.kind === 'cn' && !d.included) {
-      html += '<div class="plotbox"><div class="noplot">Excluded at review &mdash; not included in the second AneuFinder pass.</div></div>';
-    } else {
-      html += plotBox("Copy-number profile", d.plot, d.well, "profile");
-      html += plotBox("Bin read-count histogram", d.histogram, d.well, "histogram", "narrow");
-    }
-    html += '</div>';
-
-    document.getElementById("detail").innerHTML = html;
-    if (APP.kind !== 'review') return;
-
-    // wire decision buttons (live recolour; marks manual only on Save)
-    document.querySelectorAll("#decBtns .decbtn").forEach(function (b) {
-      b.addEventListener("click", function () {
-        decisions[w].decision = b.getAttribute("data-dec");
-        document.querySelectorAll("#decBtns .decbtn").forEach(function (x) {
-          var on = x.getAttribute("data-dec") === decisions[w].decision;
-          x.classList.toggle("active", on);
-          x.style.background = on ? DEC_COLOR[decisions[w].decision] : "";
-        });
-        refreshCell(w); updateProgress();
-      });
-    });
-    // wire reason buttons (toggle, multi-select)
-    document.querySelectorAll("#reasonBtns .reasonbtn").forEach(function (b) {
-      b.addEventListener("click", function () {
-        var rs = decisions[w].reasons, val = b.getAttribute("data-reason");
-        var i = rs.indexOf(val);
-        if (i === -1) { rs.push(val); b.classList.add("active"); }
-        else { rs.splice(i, 1); b.classList.remove("active"); }
-      });
-    });
-    document.getElementById("txtNotes").addEventListener("input", function (e) {
-      decisions[w].notes = e.target.value;
-    });
-    document.getElementById("btnSave").addEventListener("click", function () {
-      manual[w] = true;
-      refreshCell(w); updateProgress();
-      var sb = document.getElementById("stateBadge");
-      if (sb) { sb.className = "statebadge saved"; sb.textContent = "saved (manual)"; }
-      flash("Saved " + w + ": " + decisions[w].decision +
-            (decisions[w].reasons.length ? " (" + decisions[w].reasons.join(";") + ")" : ""));
-    });
-  }
-
-  function csvCell(v) {
-    v = (v === null || v === undefined) ? "" : String(v);
-    if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
-    return v;
-  }
-
-  function buildCSV() {
-    var lines = ["sample_id,well,decision,reason,notes"];
-    APP.wells_order.forEach(function (w) {
-      var d = decisions[w];
-      lines.push([
-        csvCell(APP.wells[w].sample_id), csvCell(w),
-        csvCell(d.decision), csvCell(d.reasons.join(";")), csvCell(d.notes)
-      ].join(","));
-    });
-    return lines.join("\n") + "\n";
-  }
-
-  function updateProgress() {
-    var counts = { PASS: 0, EXCLUDE: 0, REVIEW: 0, REPEAT: 0 }, saved = 0;
-    APP.wells_order.forEach(function (w) { counts[decisions[w].decision]++; if (manual[w]) saved++; });
-    document.getElementById("progress").textContent =
-      "PASS " + counts.PASS + " / EXCLUDE " + counts.EXCLUDE +
-      " / REVIEW " + counts.REVIEW + " / REPEAT " + counts.REPEAT + "  •  saved " + saved;
-    var _tot = APP.wells_order.length;
-    var _set = function (id, v) { var e = document.getElementById(id); if (e) e.textContent = v; };
-    var _pct = function (n) { return _tot ? (n / _tot * 100).toFixed(1) : "0"; };
-    _set("passPct", _pct(counts.PASS)); _set("passCount", counts.PASS); _set("passTotal", _tot);
-    _set("revPct", _pct(counts.REVIEW)); _set("revCount", counts.REVIEW); _set("revTotal", _tot);
-  }
-
-  function flash(msg) {
-    var el = document.getElementById("copyStatus");
-    el.textContent = msg;
-    setTimeout(function () { el.textContent = ""; }, 2500);
-  }
-
-  // header + boot
-  document.getElementById("reportTitle").textContent = APP.title || "QC Review";
-  document.getElementById("plateName").textContent = APP.plate;
-  document.getElementById("wellCount").textContent = APP.wells_order.length;
-  document.getElementById("gridMode").textContent = APP.grid.mode;
-  document.getElementById("cutPass").textContent = (APP.cutoffs && APP.cutoffs.pass != null) ? APP.cutoffs.pass.toLocaleString() : "?";
-  document.getElementById("cutWarn").textContent = (APP.cutoffs && APP.cutoffs.warn != null) ? APP.cutoffs.warn.toLocaleString() : "?";
-
-  if (APP.heatmap) {
-    document.getElementById("heatmapImg").src = APP.heatmap;
-    document.getElementById("heatmapPanel").style.display = "";
-  }
-
-  initDecisions();
-  buildMap();
-
-  if (APP.kind === 'review') {
-    updateProgress();
-  } else {
-    // cn viewer: read-only. Hide the decisions toolbar + the pass/review cards, and
-    // swap the legend to the status scheme used to colour the kept wells.
-    var tb = document.getElementById("toolbar"); if (tb) tb.style.display = "none";
-    var sc = document.getElementById("statcol"); if (sc) sc.style.display = "none";
-    var lg = document.getElementById("legend");
-    if (lg) lg.innerHTML =
-      '<span><span class="swatch" style="background:#2e7d32"></span>PASS</span>' +
-      '<span><span class="swatch" style="background:#f9a825"></span>WARN</span>' +
-      '<span><span class="swatch" style="background:#c62828"></span>FAIL</span>' +
-      '<span><span class="swatch" style="background:#9e9e9e"></span>UNKNOWN</span>' +
-      '<span><span class="swatch" style="background:#d6d6d6"></span>excluded (not in 2nd pass)</span>';
-    var mh = document.getElementById("mapHint");
-    if (mh) mh.textContent = "Cell colour = original automated QC status of the wells kept for the " +
-      "second pass; excluded wells are greyed out. Click a well to see its final CN profile + histogram.";
-  }
-
-  if (APP.wells_order.length) {
-    select(APP.wells_order[0]);
-  } else {
-    document.getElementById("detail").innerHTML = '<p style="color:#888">No wells to display.</p>';
-  }
-
-  // Shell command that writes the current decisions straight to the per-plate path.
-  // Quoted heredoc delimiter => no shell expansion of CSV/notes content.
-  function buildSaveCommand() {
-    var path = APP.decisions_path || "qc_decisions.csv";
-    var dir = APP.decisions_dir || ".";
-    // Overwrite (cat > ...) — writes the full CSV fresh each time. Warn first if the
-    // file already exists so an existing decisions file is not clobbered silently.
-    return "mkdir -p '" + dir + "'\n" +
-           "[ -e '" + path + "' ] && echo 'WARNING: overwriting existing " + path + "'\n" +
-           "cat > '" + path + "' <<'QC_DECISIONS_EOF'\n" +
-           buildCSV() + "QC_DECISIONS_EOF\n" +
-           "echo 'Wrote " + path + "'\n";
-  }
-
-  function copyText(text, okMsg) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(
-        function () { flash(okMsg); },
-        function () { fallbackCopy(text); });
-    } else { fallbackCopy(text); }
-  }
-
-  if (APP.kind === 'review') {
-    var dp = document.getElementById("decPath");
-    if (dp) dp.textContent = APP.decisions_path || "<PLATE_DIR>/qc_decisions.csv";
-
-    document.getElementById("btnCopyCmd").addEventListener("click", function () {
-      copyText(buildSaveCommand(), "Copied save command — paste it into a cluster terminal.");
-    });
-    document.getElementById("btnCopy").addEventListener("click", function () {
-      copyText(buildCSV(), "Copied " + APP.wells_order.length + " CSV rows to clipboard.");
-    });
-    document.getElementById("btnDownload").addEventListener("click", function () {
-      var blob = new Blob([buildCSV()], { type: "text/csv" });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url; a.download = "qc_decisions.csv";
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      flash("Downloaded qc_decisions.csv");
-    });
-  }
-
-  function fallbackCopy(text) {
-    var ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); flash("Copied to clipboard."); }
-    catch (e) { flash("Copy failed &mdash; use Download instead."); }
-    document.body.removeChild(ta);
-  }
-})();
+__QC_JS__
 </script>
 </body>
 </html>

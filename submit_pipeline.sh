@@ -51,6 +51,8 @@ cd "${PIPELINE_DIR}"
 # - "validate_review"    : validate a saved <PLATE_DIR>/qc_decisions.csv
 # - "aneufinder_reviewed": second AneuFinder pass on PASS wells only (needs the CSV)
 # - "cn_review"          : final copy-number review viewer over the second pass
+# - "cellenone"          : CellenONE cell images only (iterate on the image layer
+#                          without rebuilding the review HTML)
 # - "blacklist"          : blacklist diagnosis plots only
 # Defaults can be overridden at submit time, e.g.
 #   MODE=pre_review PLATE_DIR=/path/to/plate sbatch submit_pipeline.sh
@@ -58,6 +60,11 @@ MODE="${MODE:-pre_review}" # EDIT THIS
 
 # Plate directory EDIT THIS
 PLATE_DIR="${PLATE_DIR:-/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/384_well/plate17_umi/plate17_4}"
+
+# Plate format: 96 (one plate dir = one FASTQ pair) or 384 (the dir holds
+# <plate>_1..<plate>_4 subplate dirs and gets ONE plate-level AneuFinder + review).
+#   PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate21 sbatch submit_pipeline.sh
+PLATE_FORMAT="${PLATE_FORMAT:-96}"
 
 # Snakemake launcher environment
 CONDA_ENV="/camp/project/tracerX/working/CRENAL/kl_scripts/software/anaconda3/envs/snakemake_scDNA"
@@ -120,11 +127,42 @@ case "${MODE}" in
     TARGET="cn_review_report"
     echo "Building final copy-number review viewer..."
     ;;
+  cellenone)
+    TARGET="cellenone_report"
+    echo "Ingesting + rendering CellenONE cell images..."
+    ;;
   *)
     echo "ERROR: Unknown mode: ${MODE}"
     exit 1
     ;;
 esac
+
+# ----------------------------------------------------------------------------
+# Plate-format sanity checks
+# ----------------------------------------------------------------------------
+case "${PLATE_FORMAT}" in
+  96|384) ;;
+  *) echo "ERROR: PLATE_FORMAT must be 96 or 384, got '${PLATE_FORMAT}'"; exit 1 ;;
+esac
+
+PLATE_NAME="$(basename "${PLATE_DIR}")"
+# The likeliest operator mistake is pointing at a 384 plate directory but leaving
+# PLATE_FORMAT at its 96 default. That would otherwise fail deep inside Snakemake
+# with a confusing "No barcodes.tsv found".
+if [ "${PLATE_FORMAT}" = "96" ] \
+   && [ ! -f "${PLATE_DIR}/${PLATE_NAME}_R1.fastq.gz" ] \
+   && ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* >/dev/null 2>&1; then
+  echo "ERROR: ${PLATE_DIR} has no plate-level FASTQ but does contain"
+  echo "       ${PLATE_NAME}_<n>/ subplate directories:"
+  ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* 2>/dev/null | sed 's/^/         /'
+  echo "       This looks like a 384 plate directory; set PLATE_FORMAT=384."
+  echo "       (Or point PLATE_DIR at a single subplate to process it on its own.)"
+  exit 1
+fi
+if [ "${PLATE_FORMAT}" = "384" ] && ! ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* >/dev/null 2>&1; then
+  echo "ERROR: PLATE_FORMAT=384 but ${PLATE_DIR} contains no ${PLATE_NAME}_<n>/ subdirectories."
+  exit 1
+fi
 
 # Post-review modes consume the human-saved decisions file. Fail early with a clear
 # message rather than a deep Snakemake MissingInputException if it is not there yet.
@@ -151,6 +189,10 @@ echo "Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "Pipeline root: ${PIPELINE_DIR}"
 echo "Mode: ${MODE}"
 echo "Plate: ${PLATE_DIR}"
+echo "Plate format: ${PLATE_FORMAT}-well"
+if [ "${PLATE_FORMAT}" = "384" ]; then
+  echo "Subplates: $(ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+fi
 echo "Shared conda env prefix: ${SNAKEMAKE_CONDA_PREFIX}"
 echo "Shared conda package cache: ${CONDA_PKGS_DIRS}"
 echo "============================================================"
@@ -158,13 +200,13 @@ echo "============================================================"
 snakemake \
   --snakefile "${PIPELINE_DIR}/Snakefile" \
   --configfile "${PIPELINE_DIR}/config.yaml" \
-  --config plate_dir="${PLATE_DIR}" \
+  --config plate_dir="${PLATE_DIR}" plate_format="${PLATE_FORMAT}" \
   --executor slurm \
   --jobs "${JOBS}" \
   --use-conda \
   --profile /nemo/project/proj-tracerX/working/PIPELINES/Snakemake \
   --conda-prefix "${SNAKEMAKE_CONDA_PREFIX}" \
-  ${TARGET} ${EXTRA_FLAGS}
+  ${TARGET} ${EXTRA_FLAGS} ${SNAKEMAKE_EXTRA:-}
 
 EXIT_CODE=$?
 

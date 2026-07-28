@@ -32,8 +32,8 @@ option_list <- list(
               help = "PNG width in pixels [default %default]"),
   make_option(c("--height"), type = "integer", default = 430,
               help = "PNG height in pixels [default %default]"),
-  make_option(c("--res"), type = "integer", default = 110,
-              help = "PNG resolution in ppi [default %default]")
+  make_option(c("--res"), type = "integer", default = 150,
+              help = "Per-well PNG resolution in ppi; the main lever on asset size (384-well runs use 100) [default %default]")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 
@@ -76,10 +76,19 @@ render_genome_heatmap <- function(rdata_files, path) {
     write_placeholder_png(path, "Genome heatmap unavailable")
     return(invisible(FALSE))
   }
+  # Very wide aspect so chromosome columns spread out when fit to the panel width.
+  # The height MUST be capped: 46 px/row is fine for 96 wells, but a 384-well plate
+  # would ask for 7200x17664 px in a single R device (~500 MB) and OOM the job. Above
+  # the cap the rows simply get thinner, which is what a reviewer scanning a
+  # plate-wide heatmap wants anyway.
+  HEATMAP_MAX_H <- 14000L
+  h <- max(460L, min(as.integer(46 * length(rdata_files)), HEATMAP_MAX_H))
+  if (46 * length(rdata_files) > HEATMAP_MAX_H) {
+    log_info(paste0("Capping genome heatmap height at ", HEATMAP_MAX_H, " px for ",
+                    length(rdata_files), " models"))
+  }
   ok <- tryCatch({
-    # very wide aspect so chromosome columns spread out when fit to the panel width
-    grDevices::png(filename = path, width = 7200,
-                   height = max(460, 46 * length(rdata_files)), res = 120)
+    grDevices::png(filename = path, width = 7200, height = h, res = 120)
     print(hp)
     grDevices::dev.off()
     TRUE
@@ -114,7 +123,13 @@ render_well_profiles <- function() {
   # x-axis. format="svg" → vector (crisp/responsive; large files — good for the small
   # cn_review). format="png" → raster (compact; good for the 96-well first-pass review).
   # SVG always falls back to PNG if no SVG device is available. Returns basename or NA.
-  PNG_DPI <- 150L   # wide, crisp raster
+  #
+  # --res is the single biggest lever on asset weight: at 384 wells, dropping 150 -> 100
+  # takes the plots directory from ~81 MB to ~36 MB. 150 stays the default so existing
+  # 96-well reports render exactly as before.
+  PNG_DPI <- as.integer(opt$res)
+  if (is.na(PNG_DPI) || PNG_DPI <= 0) PNG_DPI <- 150L
+  log_info(paste0("Rendering PNGs at ", PNG_DPI, " ppi"))
   render_vec <- function(model, type, base_noext, w_in, h_in, breakpoints = FALSE,
                          format = "png") {
     p <- tryCatch(
