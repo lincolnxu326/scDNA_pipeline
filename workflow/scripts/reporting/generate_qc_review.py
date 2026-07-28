@@ -772,8 +772,19 @@ def main():
 
     logger.info("Resolved %d/%d profile plots, %d/%d histogram plots",
                 n_profiles, len(ids), n_hist, len(ids))
+    # No-cell-image mode. A plate is only "imaged" if an image actually resolved for at
+    # least one well — not merely because --cellenone-dir was passed. That way a run
+    # folder that is present but yields nothing degrades the same way as a plate that
+    # never had a CellenONE at all, instead of shipping 384 empty image frames.
+    has_cell_images = bool(args.cellenone_dir) and n_cell_images > 0
     if args.cellenone_dir:
         logger.info("Cell images for %d/%d wells", n_cell_images, len(ids))
+        if not has_cell_images:
+            logger.warning("--cellenone-dir %s resolved no images; building the report "
+                           "without the cell-image panel", args.cellenone_dir)
+    else:
+        logger.info("No cell images for this plate: Evidence is the copy-number "
+                    "profile and the bin-count histogram only")
     logger.info("Auto-status: PASS=%d WARN=%d FAIL=%d UNKNOWN=%d",
                 status_counts["PASS"], status_counts["WARN"],
                 status_counts["FAIL"], status_counts["UNKNOWN"])
@@ -823,6 +834,8 @@ def main():
         "mode": kind,
         "gate": {"warn": warn_cutoff, "pass": pass_cutoff},
         "bins_label": bins_label,
+        # False => qc_review.js drops the cell-image row and the droplet call.
+        "cell_images": has_cell_images,
         "decisions_path": decisions_path,
         "decisions_dir": str(Path(decisions_path).parent),
         "heatmap": heatmap_uri,
@@ -1031,7 +1044,9 @@ __QC_CSS__
 
         <div class="sect"><h3>Evidence</h3><span class="rule"></span></div>
 
-        <div class="img-row">
+        <!-- The whole cell-image layer. qc_review.js hides this row when the payload
+             says the plate has no images, leaving Evidence as profile + histogram. -->
+        <div class="img-row" id="img-row">
           <div class="img-panel">
             <div class="img-head">
               <span class="micro">CellenONE image</span>

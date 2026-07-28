@@ -66,6 +66,13 @@ PLATE_DIR="${PLATE_DIR:-/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/384_we
 #   PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate21 sbatch submit_pipeline.sh
 PLATE_FORMAT="${PLATE_FORMAT:-96}"
 
+# 384 only. Space-separated subplate directory names, for the case where they do not
+# carry the plate directory's own name and so cannot be auto-discovered:
+#   PLATE_FORMAT=384 PLATE_DIR=/…/384_well/plate17_umi \
+#   SUBPLATES="plate17_1 plate17_2 plate17_3 plate17_4" sbatch submit_pipeline.sh
+# Empty (the normal case) = auto-discover <plate>_<n> dirs holding a FASTQ pair.
+SUBPLATES="${SUBPLATES:-}"
+
 # Snakemake launcher environment
 CONDA_ENV="/camp/project/tracerX/working/CRENAL/kl_scripts/software/anaconda3/envs/snakemake_scDNA"
 CONDA_ROOT="/camp/project/tracerX/working/CRENAL/kl_scripts/software/anaconda3"
@@ -159,9 +166,32 @@ if [ "${PLATE_FORMAT}" = "96" ] \
   echo "       (Or point PLATE_DIR at a single subplate to process it on its own.)"
   exit 1
 fi
-if [ "${PLATE_FORMAT}" = "384" ] && ! ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* >/dev/null 2>&1; then
+if [ "${PLATE_FORMAT}" = "384" ] && [ -z "${SUBPLATES}" ] \
+   && ! ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* >/dev/null 2>&1; then
   echo "ERROR: PLATE_FORMAT=384 but ${PLATE_DIR} contains no ${PLATE_NAME}_<n>/ subdirectories."
+  echo "       If the subplate dirs are named differently (e.g. plate17_umi/ holding"
+  echo "       plate17_1..4), name them: SUBPLATES=\"plate17_1 plate17_2 ...\""
   exit 1
+fi
+
+# `subplates` is a LIST in config.yaml, so it has to reach --config as YAML flow
+# sequence, not as four bare words. Built here rather than in the snakemake call so
+# the 96-well path stays character-identical to before.
+SUBPLATES_CONFIG=""
+if [ -n "${SUBPLATES}" ]; then
+  if [ "${PLATE_FORMAT}" != "384" ]; then
+    echo "ERROR: SUBPLATES only applies to PLATE_FORMAT=384 (got ${PLATE_FORMAT})."
+    exit 1
+  fi
+  _list=""
+  for _s in ${SUBPLATES}; do
+    if [ ! -d "${PLATE_DIR}/${_s}" ]; then
+      echo "ERROR: SUBPLATES names '${_s}', which is not a directory under ${PLATE_DIR}."
+      exit 1
+    fi
+    _list="${_list}${_list:+,}'${_s}'"
+  done
+  SUBPLATES_CONFIG="subplates=[${_list}]"
 fi
 
 # Post-review modes consume the human-saved decisions file. Fail early with a clear
@@ -191,7 +221,11 @@ echo "Mode: ${MODE}"
 echo "Plate: ${PLATE_DIR}"
 echo "Plate format: ${PLATE_FORMAT}-well"
 if [ "${PLATE_FORMAT}" = "384" ]; then
-  echo "Subplates: $(ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+  if [ -n "${SUBPLATES}" ]; then
+    echo "Subplates: ${SUBPLATES} (explicit)"
+  else
+    echo "Subplates: $(ls -d "${PLATE_DIR}/${PLATE_NAME}"_[0-9]* 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+  fi
 fi
 echo "Shared conda env prefix: ${SNAKEMAKE_CONDA_PREFIX}"
 echo "Shared conda package cache: ${CONDA_PKGS_DIRS}"
@@ -200,7 +234,7 @@ echo "============================================================"
 snakemake \
   --snakefile "${PIPELINE_DIR}/Snakefile" \
   --configfile "${PIPELINE_DIR}/config.yaml" \
-  --config plate_dir="${PLATE_DIR}" plate_format="${PLATE_FORMAT}" \
+  --config plate_dir="${PLATE_DIR}" plate_format="${PLATE_FORMAT}" ${SUBPLATES_CONFIG} \
   --executor slurm \
   --jobs "${JOBS}" \
   --use-conda \

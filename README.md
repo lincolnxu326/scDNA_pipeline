@@ -106,8 +106,16 @@ plate21/
 
 Naming convention: lowercase `plateNN` for the plate and `plateNN_k` for the
 subplates. Subplates are found automatically as `<plate>_<n>` directories that hold
-a FASTQ pair. If the names do not follow that pattern, list them in `subplates:` in
-`config.yaml`.
+a FASTQ pair. If the names do not follow that pattern, name the subplates
+explicitly. For example, `384_well/plate17_umi/` holds `plate17_1` to `plate17_4`:
+
+```bash
+PLATE_FORMAT=384 PLATE_DIR=/path/to/384_well/plate17_umi \
+SUBPLATES="plate17_1 plate17_2 plate17_3 plate17_4" sbatch submit_pipeline.sh
+```
+
+`SUBPLATES` sets the `subplates:` list in `config.yaml`, and the submit script checks
+that each directory exists.
 
 ### Read structure
 
@@ -243,6 +251,18 @@ Written to `<PLATE_DIR>/cellenone/`:
 
 Rebuild only this layer with `MODE=cellenone`.
 
+### Plates with no cell images
+
+Nothing needs switching off. A plate with no entry in `cellenone.runs` (for example
+plate17, plate19, and every plate dispensed before CellenONE) never builds a
+`cellenone/` directory. The review report then leaves out the image panel and the
+image call, and the per-well evidence is the copy-number profile and the bin
+read-count histogram. The read gate, decisions and CSV are unchanged.
+
+The same layout is used if a run folder is configured but gives no usable image; the
+report logs a warning instead of failing. Set `qc_review.cell_images: false` to force
+this layout for a plate that does have images.
+
 ## Outputs
 
 Everything is written inside `PLATE_DIR`. Nothing is written into the repo except
@@ -329,6 +349,7 @@ Other submit-time variables:
 |----------|---------|---------|
 | `PLATE_DIR` | set in script | Plate (or 384 plate) directory |
 | `PLATE_FORMAT` | `96` | `96` or `384` |
+| `SUBPLATES` | empty | 384 only: subplate directory names, when they do not follow `<plate>_<n>` |
 | `SNAKEMAKE_EXTRA` | empty | Extra Snakemake flags, for example `--nolock` |
 
 `submit_pipeline.sh` stops early with a clear message if `PLATE_FORMAT` does not

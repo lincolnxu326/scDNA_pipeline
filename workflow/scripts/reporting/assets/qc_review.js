@@ -13,6 +13,13 @@
   var WELLS = QC.wells || [];
   var GATE = QC.gate || { warn: 50000, pass: 100000 };
   var IS_REVIEW = QC.mode !== 'cn';
+  /* Not every plate was dispensed on a CellenONE, and a run folder can be missing or
+     unmapped. When there is no cell image ANYWHERE on the plate the report drops the
+     whole image layer rather than showing 96/384 empty frames: no image panel, no
+     droplet call on the hover line. The evidence a reviewer gets is then exactly the
+     copy-number profile and the bin-count histogram. Set by generate_qc_review.py,
+     which counts the images it actually resolved. */
+  var HAS_IMAGES = !!QC.cell_images;
   var KEY = 'qc_review:' + (QC.plate || 'plate') + ':' + (QC.size || 384);
   var DECISIONS = ['PASS', 'EXCLUDE', 'REVIEW', 'REPEAT'];
   var REASON_GROUPS = [
@@ -251,7 +258,19 @@
       grid.appendChild(cell);
     }
 
-    /* image */
+    /* image. Skipped entirely on a plate with no CellenONE images — applyImageLayer()
+       has already removed the row, so there is nothing here to fill. */
+    if (HAS_IMAGES) renderImages(w);
+
+    /* plots */
+    setPlot('profile', w.profile_src, 'profile');
+    setPlot('hist', w.hist_src, 'histogram');
+    /* bin size comes from the pipeline config, not a literal — this report is not always 500 kb */
+    el('profile-note').textContent = w.status === 'FAIL' ? 'sparse — few reads per bin'
+      : 'segmented' + (QC.bins_label ? ', ' + QC.bins_label + ' bins' : '');
+  }
+
+  function renderImages(w) {
     var plate = el('plate');
     /* Channel buttons are built from the channels this well actually has: a run may
        not have used every LED, and Red exists for only a handful of wells. Falls back
@@ -298,13 +317,6 @@
                 ['Intensity', num(w.cell_int)]];
     fillRail(el('img-metrics-body'), im);
     fillRail(el('img-metrics-more'), more);
-
-    /* plots */
-    setPlot('profile', w.profile_src, 'profile');
-    setPlot('hist', w.hist_src, 'histogram');
-    /* bin size comes from the pipeline config, not a literal \u2014 this report is not always 500 kb */
-    el('profile-note').textContent = w.status === 'FAIL' ? 'sparse \u2014 few reads per bin'
-      : 'segmented' + (QC.bins_label ? ', ' + QC.bins_label + ' bins' : '');
   }
   function num(v) { return v == null ? '\u2013' : Number(v).toFixed(1); }
   function num2(v) { return v == null ? null : Number(v).toFixed(2); }
@@ -424,8 +436,10 @@
       while (t && t !== wrap && !t.getAttribute('data-id')) t = t.parentNode;
       if (!t || !t.getAttribute || !t.getAttribute('data-id')) return;
       var w2 = BY_ID[t.getAttribute('data-id')];
+      /* The droplet call is only meaningful when this plate has images; without them
+         it would read "droplet no image" on all 384 wells. */
       el('hoverline').textContent = (w2.pos ? w2.pos + ' \u00b7 ' : '') + w2.id + ' \u00b7 ' + short(w2.reads)
-        + ' reads \u00b7 gate ' + w2.status + ' \u00b7 droplet ' + w2.call;
+        + ' reads \u00b7 gate ' + w2.status + (HAS_IMAGES ? ' \u00b7 droplet ' + w2.call : '');
     });
   }
 
@@ -509,6 +523,15 @@
 
   /* cn viewer: read-only. Hide every control that writes a decision, show the
      second-pass count and the genome-wide heatmap. */
+  /* A plate with no CellenONE images loses the image row outright, so the Evidence
+     section is just the copy-number profile and the bin histogram. Hiding it (rather
+     than leaving an empty frame) is the whole no-cell-image mode on the page side —
+     the pipeline simply never builds the cellenone/ directory for such a plate. */
+  function applyImageLayer() {
+    if (HAS_IMAGES) return;
+    var row = el('img-row'); if (row) row.hidden = true;
+  }
+
   function applyMode() {
     if (IS_REVIEW) return;
     var off = ['search', 'dec', 'export'];
@@ -530,6 +553,7 @@
     buildGrid();
     buildDrawer();
     wire();
+    applyImageLayer();
     applyMode();
     var first = WELLS[0];
     S.sel = first.id;
