@@ -31,7 +31,9 @@
   };
   /* merge first: transmission with every fluorescence channel screen-blended over
      it, the same composite the cellenONE PDF report shows. */
-  var CHANNEL_ORDER = ['merge', 'trans', 'blue', 'orange', 'red'];
+  /* Button order only. `S.channel` below still defaults to merge, so the report
+     still OPENS on the composite — this just puts TRANS first in the strip. */
+  var CHANNEL_ORDER = ['trans', 'merge', 'blue', 'orange', 'red'];
   var CHANNEL_LABEL = { merge:'MERGE', trans:'TRANS', blue:'BLUE', orange:'ORANGE', red:'RED' };
   var CHROM = ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22'];
   var CHROM_W = [249,243,198,190,182,171,159,145,138,134,135,133,114,107,102,90,83,80,59,64,47,51];
@@ -79,7 +81,6 @@
     return String(n);
   }
   function pct(n, d) { return (100 * n / (d || 1)).toFixed(1) + '%'; }
-  function needsHuman(w) { return w.status !== 'FAIL' || w.call === 'CONTAMINATION' || w.call === 'FAIL'; }
   function gateClass(w) { return 'f-' + w.status; }
 
   function queue() {
@@ -88,11 +89,11 @@
     if (S.sub) list = list.filter(function (w) { return w.subplate === S.sub; });
     var q = S.query.trim().toLowerCase();
     if (q) return list.filter(function (w) { return (w.id + ' ' + (w.pos || '') + ' ' + w.well).toLowerCase().indexOf(q) !== -1; });
-    /* The queue is ALWAYS the wells that need a human. The read gate is trusted, so
-       there is no browse-everything or sample-the-failures mode. Any other well is
-       still reachable: search spans the whole plate (above), and every cell on the
-       map stays clickable. */
-    return list.filter(needsHuman);
+    /* Every well, in plate order. There was once a "needs you" subset that combined the
+       read gate with the droplet call, but no metric has earned that authority yet —
+       while this is exploratory the report shows the plate as it is and lets the
+       reviewer decide what deserves attention. */
+    return list;
   }
 
   /* ---------- mutations ---------- */
@@ -172,19 +173,18 @@
   /* ---------- render: plate map ---------- */
   function renderMap() {
     var wrap = el('wells'); if (!wrap) return;
-    var inQ = {}, q = queue();
-    for (var i = 0; i < q.length; i++) inQ[q[i].id] = 1;
     var cells = wrap.children;
     for (var c = 0; c < cells.length; c++) {
       var node = cells[c], id = node.getAttribute('data-id');
       if (!id) continue;
       var w = BY_ID[id];
       var d = IS_REVIEW ? S.decisions[id].decision : (w.included ? 'PASS' : 'EXCLUDE');
+      /* Colour is the decision, full stop. Opacity now only marks the subplate
+         filter — it no longer doubles as a "needs attention" signal. */
       node.className = 'well d-' + d
         + (id === S.sel ? ' sel' : '')
-        + (S.sub && w.subplate !== S.sub ? ' dim' : '')
-        + (IS_REVIEW && !inQ[id] ? ' faded' : '');
-      node.style.opacity = (S.sub && w.subplate !== S.sub) ? '' : (IS_REVIEW && !inQ[id] ? '.62' : '');
+        + (S.sub && w.subplate !== S.sub ? ' dim' : '');
+      node.style.opacity = '';
       var mark = node.querySelector('.mark');
       mark.className = 'mark' + (S.decided[id] ? ' decided' : S.seen[id] ? ' seen' : '');
       mark.style.display = (S.decided[id] || S.seen[id]) ? '' : 'none';
@@ -363,10 +363,10 @@
 
   /* ---------- render: header + export ---------- */
   function renderHeader() {
-    var att = WELLS.filter(needsHuman), done = 0;
-    for (var i = 0; i < att.length; i++) if (S.decided[att[i].id]) done++;
+    var done = 0;
+    for (var i = 0; i < WELLS.length; i++) if (S.decided[WELLS[i].id]) done++;
     var p = el('progress');
-    if (p) p.textContent = done + ' of ' + att.length + ' done \u00b7 ' + (att.length - done) + ' left';
+    if (p) p.textContent = done + ' of ' + WELLS.length + ' done \u00b7 ' + (WELLS.length - done) + ' left';
     var counts = { PASS: 0, EXCLUDE: 0, REVIEW: 0, REPEAT: 0 }, decided = 0;
     for (var j = 0; j < WELLS.length; j++) {
       counts[S.decisions[WELLS[j].id].decision]++;
@@ -530,7 +530,7 @@
     buildDrawer();
     wire();
     applyMode();
-    var first = WELLS.filter(needsHuman)[0] || WELLS[0];
+    var first = WELLS[0];
     S.sel = first.id;
     renderAll();
   }

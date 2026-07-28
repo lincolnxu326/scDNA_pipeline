@@ -1048,6 +1048,13 @@ __QC_CSS__
               <span class="nozzle">nozzle &#8592;</span>
               <span class="cap" id="plate-cap"></span>
             </div>
+            <!-- Outline colours follow cellenONE's own particle taxonomy
+                 (cellenREPORT S4.3), so a reviewer reading both sees the same words. -->
+            <div class="objkey micro" id="objkey">
+              <span><i style="background:#3cdc5a"></i>isolated</span>
+              <span><i style="background:#ffd228"></i>fits criteria</span>
+              <span><i style="background:#ff69b4"></i>detected</span>
+            </div>
           </div>
           <div class="img-metrics" id="img-metrics">
             <div class="hd micro">

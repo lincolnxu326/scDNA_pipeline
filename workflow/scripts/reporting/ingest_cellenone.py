@@ -50,7 +50,7 @@ import json
 import logging
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import yaml
@@ -310,13 +310,23 @@ def main():
                  "IsoDiaMinTrans", "IsoDiaMaxTrans", "IsoIntMinTrans", "IsoIntMaxTrans",
                  "IsoDiaMinFlu", "IsoDiaMaxFlu", "IsoIntMinFlu", "IsoIntMaxFlu"]
     criteria = {}
+    criteria_varied = {}
     for k in crit_keys:
-        vals = {r.get(k) for r in iso_rows if r.get(k) not in (None, "")}
-        if len(vals) == 1:
-            criteria[k] = as_float(vals.pop())
-        elif vals:
-            logger.warning("Criterion %s is not constant across rows: %s", k, sorted(vals))
-            criteria[k] = as_float(sorted(vals)[0])
+        vals = [as_float(r.get(k)) for r in iso_rows if r.get(k) not in (None, "")]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        counts = Counter(vals)
+        # The MODAL value, compared numerically. `sorted(["12","9"])[0]` is "12", so a
+        # string sort here silently picked a threshold by alphabet — and an operator
+        # really can change the criteria part-way through a run (plate22 does: 92 wells
+        # at IsoDiaMin 9 um, then 292 at 12, with IsoDiaMax moving 25 -> 30 too).
+        criteria[k] = counts.most_common(1)[0][0]
+        if len(counts) > 1:
+            criteria_varied[k] = {str(v): n for v, n in sorted(counts.items())}
+            logger.warning("Criterion %s changed during the run: %s — the per-well value "
+                           "is carried in wells_raw.tsv; run_meta records the modal %s",
+                           k, criteria_varied[k], criteria[k])
     logger.info("Run criteria: detection >= %s um, isolation window %s-%s um",
                 criteria.get("DetDiaMinTrans"),
                 criteria.get("IsoDiaMinTrans"), criteria.get("IsoDiaMaxTrans"))
@@ -415,6 +425,8 @@ def main():
         "blue_intensity", "blue_diameter_um", "orange_intensity", "orange_diameter_um",
         "red_intensity", "red_diameter_um",
         "img_trans", "img_blue", "img_orange", "img_red",
+        # This well's OWN gate, not the run summary — see criteria_varied above.
+        "det_dia_min", "iso_dia_min", "iso_dia_max",
     ]
     out_rows = []
     matched = 0
@@ -444,6 +456,9 @@ def main():
             "red_diameter_um": red.get("Diameter", ""),
             "img_trans": imgs.get("trans", ""), "img_blue": imgs.get("blue", ""),
             "img_orange": imgs.get("orange", ""), "img_red": imgs.get("red", ""),
+            "det_dia_min": t.get("DetDiaMinTrans", ""),
+            "iso_dia_min": t.get("IsoDiaMinTrans", ""),
+            "iso_dia_max": t.get("IsoDiaMaxTrans", ""),
         })
 
     # Report both directions of mismatch rather than silently dropping either side.
@@ -473,6 +488,7 @@ def main():
         "run_name": run_dir.name,
         "lines": resolve_lines(run_dir, cfg, logger),
         "criteria": criteria,
+        "criteria_varied": criteria_varied,
         "par_tparameters": par_params,
         "channel_offsets": offsets,
         "run_stats": run_stats,
