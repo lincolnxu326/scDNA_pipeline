@@ -62,10 +62,6 @@ the strict production workflow.
   - main launch script for cluster execution
 - `pre_check.sh`
   - user-facing helper
-- `generate_rule_graph.sh`
-  - user-facing helper
-- `test.sh`
-  - user-facing helper
 - `workflow/scripts/`
   - pipeline-owned execution scripts
 - `workflow/envs/`
@@ -148,8 +144,6 @@ So these are intentionally top-level and should stay easy to discover:
 
 - `submit_pipeline.sh`
 - `pre_check.sh`
-- `generate_rule_graph.sh`
-- `test.sh`
 
 Do not bury these under a helper subdirectory unless the user explicitly asks.
 
