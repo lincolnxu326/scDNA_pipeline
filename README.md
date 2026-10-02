@@ -1,443 +1,427 @@
-# scDNA Pipeline
+# scDNA Pipeline: wellDR-seq branch
 
-Snakemake workflow for single-cell DNA sequencing plates. It takes paired plate FASTQs
-through well demultiplexing, adapter-dimer filtering, alignment, UMI-aware
-deduplication and AneuFinder copy-number calling. A human review step sits between a
-first and a second AneuFinder pass. CellenONE dispenser images can be shown alongside
-each well during review.
+> **Status: under development.**
+>
+> This branch (`welldr`) targets the wellDR-seq protocol (Wang et al., Cell 188,
+> 6355-6369, 2025). This README describes the **target** pipeline. Until the phases in
+> [`docs/WELLDR_PLAN.md`](docs/WELLDR_PLAN.md) are implemented, the code on this branch
+> is still the `dlp+` pipeline and will not run wellDR-seq data.
+>
+> The legacy protocol (NlaIII digestion, Y-adapter ligation, in-pipeline demultiplexing,
+> UMI-tools deduplication, 384-well subplate mode) lives on branch `dlp+`.
 
-The repository holds code only. All plate data, intermediate files and results live in
-the plate directory you point the pipeline at, outside version control.
+Snakemake workflow for one wellDR-seq plate. Each plate produces one DNA library and
+one RNA library from the same cells. The DNA branch aligns per-well FASTQs, marks
+duplicates by position and calls copy number with AneuFinder. The RNA branch
+demultiplexes wells from Read 1 and counts genes with STARsolo. A human review step
+sits between a first and a second AneuFinder pass. After review, copy number is
+joined to the RNA layer of the same cells.
+
+The repository holds code only. All plate data, intermediate files and results live
+in the plate directory you point the pipeline at, outside version control.
 
 ## Contents
 
-1. [Quick start](#quick-start)
-2. [What the pipeline does](#what-the-pipeline-does)
-3. [Inputs](#inputs)
-4. [CellenONE run folder](#cellenone-run-folder)
-5. [Outputs](#outputs)
-6. [Running modes](#running-modes)
-7. [Review workflow](#review-workflow)
-8. [384-well plates](#384-well-plates)
-9. [Configuration reference](#configuration-reference)
-10. [Environments](#environments)
-11. [Repository layout](#repository-layout)
-12. [Further documentation](#further-documentation)
+1. [Quick start](#1-quick-start)
+2. [What the pipeline does](#2-what-the-pipeline-does)
+3. [Inputs](#3-inputs)
+4. [CellenONE run folder](#4-cellenone-run-folder)
+5. [Outputs](#5-outputs)
+6. [Running modes](#6-running-modes)
+7. [Review workflow](#7-review-workflow)
+8. [Post-review and integration](#8-post-review-and-integration)
+9. [Sequencing run requirements](#9-sequencing-run-requirements)
+10. [Configuration reference](#10-configuration-reference)
+11. [Environments](#11-environments)
+12. [Repository layout](#12-repository-layout)
+13. [Open items](#13-open-items)
+14. [Further documentation](#14-further-documentation)
 
-## Quick start
+## 1. Quick start
 
 ```bash
 # 1. Check the setup
 bash pre_check.sh
 
-# 2. First pass: preprocessing, AneuFinder on all wells, review report. Stops here.
-MODE=pre_review PLATE_DIR=/path/to/plate17_4 sbatch submit_pipeline.sh
+# 2. First pass: DNA and RNA processing, AneuFinder on all wells, review report. Stops here.
+MODE=pre_review PLATE_DIR=/path/to/plateNN sbatch submit_pipeline.sh
 
 # 3. Open <PLATE_DIR>/qc_review/review.html, make decisions, save qc_decisions.csv
 
-# 4. Second pass: AneuFinder on PASS wells, final copy-number viewer
-MODE=post_review PLATE_DIR=/path/to/plate17_4 sbatch submit_pipeline.sh
+# 4. Second pass: AneuFinder on PASS wells, final copy-number viewer, RNA + CN integration
+MODE=post_review PLATE_DIR=/path/to/plateNN sbatch submit_pipeline.sh
 ```
 
-For a 384-well plate add `PLATE_FORMAT=384` and point `PLATE_DIR` at the plate
-directory that holds the four subplates:
-
-```bash
-PLATE_FORMAT=384 MODE=pre_review PLATE_DIR=/path/to/384_well/plate21 sbatch submit_pipeline.sh
-```
+Plate size (384 or 5,184 wells) is read from `well_map.tsv`. There is no
+`PLATE_FORMAT` setting.
 
 To run several plates at the same time from this directory, add
-`SNAKEMAKE_EXTRA=--nolock`. Snakemake locks the pipeline directory, but each plate
-writes to its own `PLATE_DIR`, so the runs do not collide.
+`SNAKEMAKE_EXTRA=--nolock`. Each plate writes only inside its own `PLATE_DIR`.
 
-## What the pipeline does
+## 2. What the pipeline does
+
+### 2.1 DNA branch
 
 | # | Stage | Tool | Output folder |
 |---|-------|------|---------------|
-| 1 | Demultiplex plate FASTQs into well FASTQs, extract UMI | Python | `demux/` |
-| 2 | Remove adapter-dimer reads | Python | `filtered/` |
-| 3 | Read QC | FastQC, MultiQC | `fastqc/`, `multiqc/` |
-| 4 | Align each well | Bowtie2, Samtools | `raw_bam/` |
-| 5 | UMI-aware deduplication | UMI-tools (`directional`) | `bam/`, `dedup/` |
-| 6 | Blacklist diagnostics from a mappability reference | R | `mappability/` |
-| 7 | First AneuFinder pass, all wells | AneuFinder (`edivisive`, 1 Mb bins) | `aneufinder/` |
-| 8 | Static HTML review report | Python, R | `qc_review/` |
-| 9 | CellenONE image ingest and rendering (optional) | Python | `cellenone/` |
-| 10 | Human review, saved as a CSV | browser | `qc_decisions.csv` |
-| 11 | Second AneuFinder pass, PASS wells only | AneuFinder | `aneufinder_reviewed/` |
-| 12 | Final copy-number viewer | Python, R | `CN_review/` |
+| D1 | Check DNA inputs against `well_map.tsv` (missing, empty and unexpected wells) | Python | `qc/` |
+| D2 | Adapter trimming (Nextera) | fastp | `trimmed/` |
+| D3 | Read QC | FastQC, MultiQC | `fastqc/`, `multiqc/` |
+| D4 | Alignment | bowtie2, samtools | `raw_bam/` |
+| D5 | Position-based duplicate marking | samtools markdup | `markdup/`, `bam/` |
+| D6 | Library complexity per well | Python | `markdup/` |
+| D7 | Index hopping QC: reads in empty wells, by row and by column | Python | `qc/` |
+| D8 | First AneuFinder pass, all wells | AneuFinder | `aneufinder/` |
 
-Stages 1 to 9 run under `MODE=pre_review`. Stages 11 and 12 run under
-`MODE=post_review`.
+Duplicates are marked by alignment position, without UMIs. This is valid because
+Tn5 fragment ends are random (paper, STAR Methods, "Data preprocessing"; the authors
+used `sambamba markdup`).
 
-## Inputs
+### 2.2 RNA branch
 
-### Plate directory (96-well)
+| # | Stage | Tool | Output folder |
+|---|-------|------|---------------|
+| R1 | Demultiplex wells from Read 1: check fixed adapter and polyT, match RNA-CB1 and RNA-CB2 with up to 1 mismatch each | Python | `rna/demux/` |
+| R2 | Trimming (adapters, polyA, Nextera N7 and S5) | Trimmomatic or fastp | `rna/trimmed/` |
+| R3 | Gene counting, SmartSeq mode | STARsolo | `rna/starsolo/` |
+| R4 | RNA QC per well: reads, genes, counts, mitochondrial fraction | Python or R | `rna/qc/` |
 
-One directory per 96-well plate. The FASTQ names must match the directory name,
-because the pipeline reads `<PLATE_DIR>/<dir name>_R1.fastq.gz`.
+The RNA library has **no UMI**. The 10 bp random sequence in Read 1 is added during
+the cDNA enrichment PCR, not at reverse transcription, so it does not identify
+original molecules. STARsolo runs with `--soloUMIdedup Exact NoDedup`. The random
+sequence is kept in the read name for QC only.
 
-```text
-plate17_4/
-├── plate17_4_R1.fastq.gz      required
-├── plate17_4_R2.fastq.gz      required
-└── barcodes.tsv               required unless a shared table exists (see below)
-```
+### 2.3 Shared stages
 
-Symlinks to FASTQs stored elsewhere are fine.
+| # | Stage | Output folder |
+|---|-------|---------------|
+| S1 | CellenONE image ingest and rendering (optional, display-only) | `cellenone/` |
+| S2 | Static HTML review report | `qc_review/` |
+| S3 | Human review, saved as a CSV | `qc_decisions.csv` |
+| S4 | Second AneuFinder pass, PASS wells only | `aneufinder_reviewed/` |
+| S5 | Final copy-number viewer | `CN_review/` |
+| S6 | RNA + copy-number integration | `integrated/` |
 
-### Plate directory (384-well)
+`MODE=pre_review` runs D1 to D8, R1 to R4, S1 and S2. `MODE=post_review` runs S4 to S6.
 
-A 384-well plate is four 96-well subplates, each sequenced as its own FASTQ pair.
-Subplate directories are named `<plate>_1` to `<plate>_4` and each follows the
-96-well layout above.
+## 3. Inputs
 
-```text
-plate21/
-├── plate21_1/
-│   ├── plate21_1_R1.fastq.gz
-│   ├── plate21_1_R2.fastq.gz
-│   └── barcodes.tsv
-├── plate21_2/  (same)
-├── plate21_3/  (same)
-├── plate21_4/  (same)
-└── <CellenONE .Run folder>    optional, may also live elsewhere
-```
+### 3.1 Plate directory
 
-Naming convention: lowercase `plateNN` for the plate and `plateNN_k` for the
-subplates. Subplates are found automatically as `<plate>_<n>` directories that hold
-a FASTQ pair. If the names do not follow that pattern, list them in `subplates:` in
-`config.yaml`.
-
-### Read structure
-
-Set under `preprocessing:` in `config.yaml`. These values come from the original
-lab scripts and should not change unless the library chemistry changes.
-
-| Read | Layout |
-|------|--------|
-| R1 | 8 bp well barcode, 14 bp linker, then genomic sequence (22 bp trimmed) |
-| R2 | 12 bp UMI, 8 bp well barcode, 14 bp linker, then genomic sequence (34 bp trimmed) |
-
-Wells are assigned by the R1 barcode.
-
-### barcodes.tsv
-
-Tab-separated, with a header, one row per well:
+One directory per plate. One plate is one DNA library and one RNA library.
 
 ```text
-well_id	barcode
-W01	TCTCATCG
-W02	CCAACAGT
-...
-W96	...
+plateNN/
+├── well_map.tsv                         required
+├── dna/
+│   └── fastq/
+│       ├── <well_id>_R1.fastq.gz        one pair per well, from bcl-convert
+│       └── <well_id>_R2.fastq.gz
+├── rna/
+│   ├── plateNN_RNA_R1.fastq.gz          one pair for the whole plate
+│   └── plateNN_RNA_R2.fastq.gz
+└── <CellenONE .Run folder>              optional, may also live elsewhere
 ```
 
-The pipeline looks for the table in this order and uses the first one found:
+DNA wells are already separated by the sequencing facility's demultiplexing on the
+i7 and i5 index reads, so the pipeline does not demultiplex DNA. Name the per-well
+FASTQs (or symlinks to them) `<well_id>_R1.fastq.gz` and `<well_id>_R2.fastq.gz`.
 
-1. `resources/barcodes.tsv` (shared, in this repo)
-2. `resources/barcodes/barcodes.tsv` (shared, in this repo)
-3. `<PLATE_DIR>/barcodes.tsv` (per plate; per subplate in 384 mode)
+The RNA FASTQ is split by library only. The pipeline demultiplexes RNA wells from
+Read 1 (stage R1).
 
-In 384 mode all four subplates must list `well_id` in the same order.
+### 3.2 well_map.tsv
 
-### Reference files
+`well_map.tsv` is the only file that knows the plate geometry. Every per-well rule,
+the review plate map and the CellenONE mapping read it. Tab-separated, with a header,
+one row per well.
+
+| Column | Meaning |
+|--------|---------|
+| `well_id` | Well identifier used in every file name and in `sample_id` |
+| `row` | Row index, 1-based |
+| `col` | Column index, 1-based |
+| `dna_i7` | DNA-CB1, 8 bp, as read in the i7 index read |
+| `dna_i5` | DNA-CB2, 8 bp, as read in the i5 index read (orientation: see section 9) |
+| `rna_cb1` | RNA-CB1, 8 bp, as it appears in Read 1 |
+| `rna_cb2` | RNA-CB2, 8 bp, as it appears in Read 1 |
+| `cellenone_pos` | CellenONE position token for this well. **Open item, see section 13.** |
+
+**Proposal for `well_id`:** `R<row>C<col>` with two-digit zero-padded row and column,
+for example `R01C01` to `R72C72`. Letter rows (A to P) do not extend to 72 rows. The
+`sample_id` used in review files is `<plate>_<well_id>`, for example `plate30_R05C17`.
+This format is a proposal and is not yet fixed.
+
+Example (barcodes are placeholders):
+
+```text
+well_id	row	col	dna_i7	dna_i5	rna_cb1	rna_cb2	cellenone_pos
+R01C01	1	1	NNNNNNNN	NNNNNNNN	NNNNNNNN	NNNNNNNN	(open)
+R01C02	1	2	NNNNNNNN	NNNNNNNN	NNNNNNNN	NNNNNNNN	(open)
+```
+
+In the published 72 x 72 design the i7 index (DNA-CB1) and RNA-CB2 encode the column,
+and the i5 index (DNA-CB2) and RNA-CB1 encode the row. The paper text states only
+"72 (row index) by 72 (column index)" barcodes; the axis assignment is to be verified
+against Table S5 in Phase 0. The pipeline does not rely on it: it reads every well's
+barcodes from `well_map.tsv`.
+
+`workflow/scripts/make_samplesheet.py` (planned) writes the bcl-convert sample sheet
+for the DNA library from `well_map.tsv`.
+
+### 3.3 Read structure
+
+**DNA library.** Paired-end genomic reads. Well identity is in the index reads only.
+
+| Read | Content |
+|------|---------|
+| i7 index (8 bp) | DNA-CB1 |
+| i5 index (8 bp) | DNA-CB2 |
+| R1, R2 | Tn5-tagmented genomic DNA, Nextera adapters at the 3' end of short inserts |
+
+**RNA library.** Read 1 uses the custom sequencing primer WDR_Read1. Positions are
+0-based.
+
+| Read 1 bases | Content |
+|--------------|---------|
+| 0 to 7 | RNA-CB2 |
+| 8 to 17 | 10 bp random sequence (not a UMI) |
+| 18 to 31 | fixed adapter `GAGGCGTAGTGGCT` |
+| 32 to 39 | RNA-CB1 |
+| 40 onward | polyT |
+
+Read 2 is cDNA. The library is 3'-anchored.
+
+### 3.4 Reference files
 
 Set in `config.yaml`. All must exist before a run.
 
 | Key | What it is |
 |-----|------------|
-| `genome.fasta` | Reference FASTA. Chromosomes must be named `chr1` to `chr22`, `chrX`, `chrY`. |
-| `genome.index_prefix` | Bowtie2 index prefix for that FASTA |
-| `mappability.reference_bam` | Euploid reference BAM used for blacklist diagnostics |
-| GC template RDS | `resources/reference/hg38_binsize1000000_variable_bins_with_GC.rds`, or set `aneufinder.gc_rds` |
+| `genome.fasta` | Reference FASTA, hg38. Chromosomes named `chr1` to `chr22`, `chrX`, `chrY`. |
+| `genome.index_prefix` | bowtie2 index for that FASTA |
+| `rna.star_index` | STAR index for hg38 with a matching GTF (planned) |
+| `rna.gtf` | Gene annotation used by STARsolo and by the gene-to-bin map (planned) |
+| `mappability.reference_bam` | Euploid reference BAM for blacklist diagnostics. **To be rebuilt from wellDR-seq euploid cells, see section 13.** |
+| GC template RDS | `resources/reference/hg38_binsize1000000_variable_bins_with_GC.rds`, or set `aneufinder.gc_rds`. Must match `aneufinder.binsize`. |
 
-The GC template must match `aneufinder.binsize`. `run_aneufinder.R` is set up for
-1 Mb bins.
+The authors aligned to hg19. This pipeline uses hg38.
 
-## CellenONE run folder
+## 4. CellenONE run folder
 
-This step is optional and display-only. It never changes a well's automatic status or
-its default decision. It adds a cell-image panel to the review report so a reviewer
-can see what the dispenser put in each well.
+Cells are dispensed on CellenONE. The CellenONE layer is optional and display-only:
+it never changes a well's automatic status or default decision.
 
-### Enabling it
-
-Map the plate name to its CellenONE `.Run` folder in `config.yaml`:
+Map the plate name to its `.Run` folder in `config.yaml`:
 
 ```yaml
 cellenone:
   enable: true
   runs:
-    plate21: "/path/to/P21_22/plate_2/K1563_plate_2_20260707_135300_812.Run"
-    plate24: "/path/to/384_well/plate24/P1_K1570_V_20260902_142546_324.Run"
+    plateNN: "/path/to/<run name>.Run"
 ```
 
-The key is the `PLATE_DIR` name (for 384 mode, the plate, not a subplate). The
-pipeline never guesses this mapping, because CellenONE names do not match ours
-(CellenONE `plate_2` is our `plate21`). A plate with no entry simply runs without
-cell images.
+The folder contents, the image call (`SINGLE`, `PASS`, `CONTAMINATION`, `FAIL`,
+`NO_OBJECT`, `NO_IMAGE`) and the `cellenone/` output files are unchanged from the
+`dlp+` branch and are described in
+[`docs/CELLENONE_AND_QC.md`](docs/CELLENONE_AND_QC.md). In short, the folder needs
+`Reordered_*_isolated.xls` and the `*_Printed_*_(<POS>)_Trans_*.png` images; the
+fluorescence images, `geoprops.xls`, `BackgroundEjZone` and `cellenREPORT/` are
+optional.
 
-### What the folder must contain
+**Open item:** how CellenONE names well positions for 384-well and 5,184-well
+targets, and how those names map to `well_map.tsv` (`cellenone_pos`). Until this is
+settled, images are matched only for layouts where the mapping has been verified.
 
-Point the config at the `.Run` folder itself, exactly as the CellenONE software wrote
-it. Do not rename files inside it.
-
-| File | Required | Used for |
-|------|----------|----------|
-| `Reordered_*_isolated.xls` | **yes** | Per-well table: position, diameter, shape, intensity, and the run's detection and isolation criteria. Falls back to `*_isolated.xls` if no `Reordered_` copy exists. |
-| `*_Printed_*_(<POS>)_Trans_*.png` | **yes** | Transmission image of each printed drop |
-| `*_Printed_*_(<POS>)Blue_*.png`, `Green`, `Orange`, `Red` | optional | Fluorescence images. Only channels the run recorded are used. |
-| `Reordered_*_geoprops.xls` | optional | Run-level statistics (drops attempted, isolation rate) |
-| `*BackgroundEjZone*.png` | optional | Its width gives the purple ejection line |
-| `cellenREPORT/Images_iso_det/Trans_*.jpg` | optional | Annotated frames; the green and purple lines are detected from them |
-| `*.par`, `Tscatter.xls`, `Fscatter.xls`, `Clonality/`, `*.log` | not used | Left in place, ignored |
-
-Notes on these files:
-
-- The `.xls` files are tab-separated text, not Excel. Open them in a text editor if
-  you need to check them.
-- Images are matched to wells by the `(<POS>)` token in the filename, for example
-  `(K-22)`. They are never matched by count or order. A run often has a few extra
-  or missing images, and that is fine.
-- `<POS>` uses the 384-plate grid (`A-1` to `P-24`) for 384 runs and the 96-plate
-  grid (`A-1` to `H-12`) for 96 runs. In 96 mode `W01` is `A1`, `W02` is `B1`, and
-  so on down each column.
-- Detection and isolation thresholds are read from the run's own table, per well.
-  They differ between runs and can change partway through a run (plate22 used three
-  settings).
-- If neither the annotated JPEGs nor the `BackgroundEjZone` image is present, the
-  ejection lines fall back to `cellenone.lines.green_default` (396 px) and
-  `purple_default` (647 px).
-
-### Image call
-
-The transmission image is scored against the two ejection lines. The nozzle is on
-the left; objects to the right of the purple line are still up the capillary and are
-not ejected.
-
-| Condition | Call |
-|-----------|------|
-| exactly 1 object | `SINGLE` |
-| 2 or more objects, rightmost right of the purple line | `PASS` |
-| rightmost object between the green and purple lines | `CONTAMINATION` |
-| all objects left of the green line | `FAIL` |
-| 0 objects | `NO_OBJECT` |
-| no image for this well | `NO_IMAGE` |
-
-This image `PASS`/`FAIL` is not the sequencing `PASS`/`FAIL`. See
-[`docs/CELLENONE_AND_QC.md`](docs/CELLENONE_AND_QC.md) for how the two differ and
-where each number comes from.
-
-### CellenONE outputs
-
-Written to `<PLATE_DIR>/cellenone/`:
-
-| File | Contents |
-|------|----------|
-| `wells_raw.tsv` | One row per well: CellenONE measurements and that well's own criteria |
-| `objects.tsv` | One row per detected object: position, diameter, category |
-| `cellenone_wells.tsv` | Per-well summary the report reads: object counts, image call, image paths |
-| `run_meta.json` | Ejection lines and their source, criteria, channel offsets, pixel scale, run stats |
-| `images/` | Rendered JPEGs, one per well per channel |
-
-Rebuild only this layer with `MODE=cellenone`.
-
-## Outputs
+## 5. Outputs
 
 Everything is written inside `PLATE_DIR`. Nothing is written into the repo except
 logs under `logs/`.
 
-### 96-well plate
-
 ```text
-plate17_4/
-├── demux/                 per-well FASTQs and demultiplexing stats
-├── filtered/              per-well FASTQs after adapter-dimer removal
-├── fastqc/                FastQC per well
-├── multiqc/               MultiQC report for the plate
-├── raw_bam/               aligned BAMs before deduplication
-├── bam/                   deduplicated BAMs: W01.bam, .bai, .stats.txt, .flagstat.txt
-├── dedup/                 UMI-tools logs and dedup_summary.tsv
-├── mappability/           blacklist diagnostic plots
-├── aneufinder/            first pass, all wells
-│   ├── MODELS/            per-well .RData models
-│   ├── profiles_edivisive.pdf
-│   └── Genome_heatmap_cluster_1Mb_bins_edivisive.pdf
-├── cellenone/             only if CellenONE is configured
+plateNN/
+├── well_map.tsv, dna/, rna/            inputs (section 3)
+├── qc/                                 input check, index hopping QC
+├── trimmed/                            per-well trimmed DNA FASTQs
+├── fastqc/                             FastQC per well
+├── multiqc/                            MultiQC over fastp, markdup and STARsolo logs
+├── raw_bam/                            aligned DNA BAMs before duplicate marking
+├── markdup/                            duplicate-marking metrics, complexity per well
+├── bam/                                <well_id>.bam (+ .bai, .stats.txt, .flagstat.txt)
+├── mappability/                        blacklist diagnostic plots
+├── rna/
+│   ├── demux/                          per-well RNA FASTQs and demux stats
+│   ├── trimmed/
+│   ├── starsolo/                       STARsolo output: Gene and GeneFull matrices
+│   └── qc/                             per-well RNA metrics
+├── aneufinder/                         first pass, all wells (MODELS/, profiles, heatmap)
+├── cellenone/                          only if CellenONE is configured
 ├── qc_review/
-│   ├── review.html        review report (open this)
-│   └── plots/             per-well profile and histogram images
-├── qc_decisions.csv       written by you after review
-├── aneufinder_reviewed/   second pass, PASS wells only
+│   ├── review.html                     review report (open this)
+│   ├── plots/
+│   └── assets/
+├── qc_decisions.csv                    written by you after review
+├── aneufinder_reviewed/                second pass, PASS wells only
 ├── CN_review/
-│   ├── cn_review.html     final copy-number viewer (the deliverable)
+│   ├── cn_review.html                  final copy-number viewer
 │   ├── plots/
 │   └── genome_heatmap.png
+├── integrated/                         gene-to-bin map, per-cell gene CN, RNA + CN object
 └── logs/
 ```
 
-### 384-well plate
+**AneuFinder handoff.** `bam/<well_id>.bam` is the file AneuFinder reads. It is the
+coordinate-sorted, duplicate-marked BAM. This contract is the same as on `dlp+`
+(where it was the UMI-deduplicated BAM), so `run_aneufinder.R` does not change.
 
-Preprocessing outputs (`demux/` to `dedup/`) stay inside each subplate directory.
-AneuFinder, review, CellenONE and the final viewer are plate-level:
+## 6. Running modes
 
-```text
-plate21/
-├── plate21_1/ .. plate21_4/   demux/ filtered/ fastqc/ multiqc/ raw_bam/ bam/ dedup/
-├── aneufinder/                one pass over all 384 wells
-├── cellenone/
-├── qc_review/
-│   ├── review.html
-│   ├── plots/
-│   └── assets/                cell images, loaded on click
-├── qc_decisions.csv
-├── aneufinder_reviewed/
-└── CN_review/
-```
-
-A 96-well `review.html` is one self-contained file (about 20 MB) and opens over Samba
-or as a local file. A 384-well report would be about 107 MB that way, so it loads
-plots and images from `plots/` and `assets/` next to it instead. Copy the whole
-`qc_review/` folder if you move it. Set `qc_review.embed_assets: true` to force a
-single file.
-
-Well identity in 384 mode is `<subplate>_<well>`, for example `plate21_2_W07`. This
-is the same ID the subplate gets in a standalone 96-well run.
-
-## Running modes
-
-Set `MODE` at submit time. Defaults in `submit_pipeline.sh` can also be edited.
+Set `MODE` at submit time.
 
 | Mode | What it runs |
 |------|--------------|
-| `pre_review` | Everything up to the first-pass review report, then stops. Default. |
-| `post_review` | Validate decisions, second AneuFinder pass, final viewer. Needs `qc_decisions.csv`. |
-| `preprocessing` | Demux, filtering, alignment, dedup |
-| `qc` | Preprocessing plus FastQC and MultiQC |
-| `aneufinder_first` | Blacklist plus first AneuFinder pass |
+| `pre_review` | DNA and RNA processing, first AneuFinder pass, review report, then stops. Default. |
+| `post_review` | Validate decisions, second AneuFinder pass, `CN_review`, integration. Needs `qc_decisions.csv`. |
+| `dna` | DNA branch D1 to D7 only (planned) |
+| `rna` | RNA branch R1 to R4 only (planned) |
 | `review` | Rebuild `review.html` only |
 | `validate_review` | Check `qc_decisions.csv` only |
 | `aneufinder_reviewed` | Second AneuFinder pass only |
 | `cn_review` | Rebuild `cn_review.html` only |
+| `integrate` | Integration stage only (planned) |
 | `cellenone` | CellenONE ingest and images only |
 | `blacklist` | Blacklist diagnostic plots only |
 
-Other submit-time variables:
+Submit-time variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PLATE_DIR` | set in script | Plate (or 384 plate) directory |
-| `PLATE_FORMAT` | `96` | `96` or `384` |
+| `PLATE_DIR` | set in script | Plate directory |
 | `SNAKEMAKE_EXTRA` | empty | Extra Snakemake flags, for example `--nolock` |
 
-`submit_pipeline.sh` stops early with a clear message if `PLATE_FORMAT` does not
-match the directory layout, or if a post-review mode runs before `qc_decisions.csv`
-exists.
+`PLATE_FORMAT` and `SUBPLATES` are removed on this branch.
 
-## Review workflow
+## 7. Review workflow
 
-### Automatic status (read count only)
-
-Each well gets an automatic status from `usable_reads`, the number of mapped reads
-in the deduplicated BAM. It pre-fills the decision. The reviewer can change any
-decision.
-
-| usable_reads | Status | Default decision |
-|--------------|--------|------------------|
-| 100,000 or more | `PASS` | PASS |
-| 50,000 to 99,999 | `WARN` | REVIEW |
-| below 50,000 | `FAIL` | EXCLUDE |
-| missing | `UNKNOWN` | REVIEW |
-
-Cutoffs are `qc_review.usable_reads_pass_cutoff` and `usable_reads_warn_cutoff`.
-Duplication rate is shown for information only and does not affect the status.
-
-### Making decisions
+The review flow is the same as on `dlp+`:
 
 1. Open `<PLATE_DIR>/qc_review/review.html`.
-2. Click a well to see its copy-number profile, read-count histogram, metrics and
-   (if configured) cell images.
+2. Click a well to see its copy-number profile, read-count histogram, metrics,
+   RNA panel and (if configured) cell images.
 3. Choose PASS, EXCLUDE, REVIEW or REPEAT, add reasons and notes, and click
    **Save decision**.
 4. Click **Copy terminal save command** and paste it into a cluster terminal. This
-   writes `<PLATE_DIR>/qc_decisions.csv`. **Download qc_decisions.csv** and placing
-   the file at that path also works.
+   writes `<PLATE_DIR>/qc_decisions.csv`.
 5. Run `MODE=post_review`.
 
-Only PASS wells go to the second pass. Set `qc_review.include_review: true` to also
-include REVIEW wells. The CSV schema is in [`config/README.md`](config/README.md).
+Changes on this branch:
 
-The final `CN_review/cn_review.html` shows the whole plate. Wells kept for the second
-pass show their final profile; excluded wells are greyed out.
+- **Plate map.** A generic rows x columns grid built from `well_map.tsv`, replacing
+  the fixed 96-well grid and the 384 subplate tabs.
+- **DNA metrics.** Duplication rate and library complexity from `markdup/` replace
+  UMI-tools retention.
+- **RNA panel.** Per-well genes detected, RNA reads, mitochondrial fraction.
+- **Scale.** At 5,184 wells the report always uses sidecar `plots/` and `assets/`
+  rather than embedding images. Copy the whole `qc_review/` folder if you move it.
 
-## 384-well plates
+### 7.1 Automatic status
 
-A 384-well plate is dispensed as four interleaved 96-well subplates. Subplate and
-well are derived from the 384 position by formula. For row `r` (0 to 15, A to P)
-and column `c` (0 to 23, 1 to 24):
+Each well gets an automatic status from `usable_reads` that pre-fills the decision.
+The reviewer can change any decision.
 
-```text
-subplate_index = (r % 2) + 2 * (c // 12)      # 0 is SL1, 3 is SL4
-well_number    = (c % 12) * 8 + (r // 2) + 1  # W01..W96
-```
+| usable_reads | Status | Default decision |
+|--------------|--------|------------------|
+| at or above `usable_reads_pass_cutoff` | `PASS` | PASS |
+| between the two cutoffs | `WARN` | REVIEW |
+| below `usable_reads_warn_cutoff` | `FAIL` | EXCLUDE |
+| missing | `UNKNOWN` | REVIEW |
 
-So SL1 is rows A, C, E... in columns 1 to 12, SL2 is rows B, D, F... in columns
-1 to 12, and SL3 and SL4 are the same over columns 13 to 24. Check this against a
-plate map with:
+On this branch `usable_reads` is mapped, non-duplicate reads with MAPQ of at least 1
+in `bam/<well_id>.bam` (proposal). The cutoffs carried over from `dlp+` (100,000 and
+50,000) are placeholders until they are re-tuned on wellDR-seq data (section 13). For
+reference, the authors excluded cells under 100K reads when the plate mean was about
+500K, and cells with more than 10% empty bins.
 
-```bash
-python workflow/scripts/reporting/plate384_layout.py --check-xlsx plate_mapping_384.xlsx
-```
+RNA metrics are shown in the review but do not set the automatic status.
 
-For a non-standard layout, set `plate_layout_tsv` in `config.yaml` (columns
-`subplate`, `well`, `pos384`).
+## 8. Post-review and integration
 
-**Reusing subplate runs.** AneuFinder models are per cell, so a subplate already run
-in 96 mode has the same models as a plate-level run. `aneufinder.plate384_models`
-controls reuse:
+`MODE=post_review` runs:
 
-| Value | Behaviour |
-|-------|-----------|
-| `auto` | Reuse if every subplate has models, otherwise compute (default) |
-| `reuse` | Always reuse; error if a subplate has no models |
-| `rerun` | Always recompute at plate level |
+1. Validation of `qc_decisions.csv` and derivation of the PASS wells
+   (`qc_review.include_review: true` also includes REVIEW wells).
+2. Second AneuFinder pass on the PASS wells, into `aneufinder_reviewed/`.
+3. The final viewer `CN_review/cn_review.html`.
+4. Integration, into `integrated/` (file names are proposals):
 
-With reuse, a full 384-well review is ready in minutes.
+| File | Contents |
+|------|----------|
+| `gene_bin_map.tsv` | Each gene from the GTF assigned to its AneuFinder bin |
+| `cell_gene_cn.tsv.gz` | Per-cell integer copy number for each gene, from the second-pass models |
+| `<plate>_rna_cn.rds` | Combined object: RNA counts from STARsolo plus per-cell copy number, joined on `well_id` |
 
-The review report shows one 16 x 24 plate map with tabs `All | SL1 | SL2 | SL3 | SL4`.
-The exported CSV has an extra `subplate` column.
+Downstream analyses planned on top of `integrated/`, following the paper (see
+`docs/WELLDR_PLAN.md`): DNA subclones from UMAP and dbscan on segment values, gene
+dosage correlation between subclone pseudobulk expression and subclone copy number,
+cis and trans differential expression between subclones, and RNA-inferred copy
+number (CopyKAT, inferCNV) as a concordance check against the DNA calls.
 
-## Configuration reference
+## 9. Sequencing run requirements
 
-All settings are in `config.yaml`. The ones most often changed:
+The run configuration (instrument, read lengths) is not yet fixed. These are the
+minimum requirements the pipeline depends on.
 
-| Key | Default | Notes |
-|-----|---------|-------|
-| `plate_format` | `96` | Usually set with `PLATE_FORMAT` at submit time |
-| `subplates` | `[]` | Explicit subplate list for 384 mode; empty means auto-discover |
-| `aneufinder.binsize` | `1000000` | Must match the GC template |
-| `aneufinder.min_reads_for_model` | `100` | Wells below this are not given to AneuFinder. A near-empty well otherwise aborts the whole batch. |
-| `aneufinder.plate384_models` | `auto` | See [384-well plates](#384-well-plates) |
-| `qc_review.usable_reads_pass_cutoff` | `100000` | |
-| `qc_review.usable_reads_warn_cutoff` | `50000` | |
-| `qc_review.include_review` | `false` | Include REVIEW wells in the second pass |
-| `qc_review.plot_res` / `plot_res_384` | `150` / `100` | Plot DPI |
-| `qc_review.embed_assets` | `auto` | Single-file report at 96, sidecar assets at 384 |
-| `cellenone.runs` | | Plate name to `.Run` folder |
-| `cellenone.image.channels` | all | Channels to render; missing or empty channels are skipped |
-| `resources.<rule>` | | SLURM threads, memory, time, partition per rule |
+**DNA library**
 
-## Environments
+- Index reads: 8 cycles i7 and 8 cycles i5.
+- Demultiplex with 0 index mismatches, giving one FASTQ pair per well.
+- The orientation of the i5 sequence in the sample sheet depends on the instrument.
+  Record it explicitly with each run and verify it from the Undetermined index counts
+  before running the pipeline.
+- Indexing is combinatorial (non-unique dual): wells share i7 values along one axis
+  and i5 values along the other. Index hopping therefore moves reads between wells
+  that share a row or a column. Stage D7 measures this.
+
+**RNA library**
+
+- Read 1 of at least 48 cycles with the custom WDR_Read1 primer, so that both cell
+  barcodes and the start of polyT are read (8 + 10 + 14 + 8 = 40 bp, plus 8 bp polyT).
+- The authors also spiked in a custom index 2 primer (WDR_Idx5) and sequenced on a
+  NextSeq 2000 (paper, STAR Methods step 7).
+
+## 10. Configuration reference
+
+All settings are in `config.yaml`. Keys marked (planned) do not exist yet.
+
+| Key | Notes |
+|-----|-------|
+| `well_map` (planned) | Path to `well_map.tsv`, default `<PLATE_DIR>/well_map.tsv` |
+| `dna.trim` (planned) | fastp adapter settings |
+| `dna.min_mapq` (planned) | MAPQ threshold for `usable_reads`, proposed 1 |
+| `rna.demux` (planned) | Adapter, polyT check, barcode mismatches (1) |
+| `rna.star_index`, `rna.gtf` (planned) | STAR index and annotation |
+| `rna.qc` (planned) | Gene-count and mitochondrial-fraction thresholds |
+| `aneufinder.binsize` | Must match the GC template |
+| `aneufinder.min_reads_for_model` | Wells below this are not given to AneuFinder. To be re-tuned. |
+| `qc_review.usable_reads_pass_cutoff`, `usable_reads_warn_cutoff` | To be re-tuned |
+| `qc_review.include_review` | Include REVIEW wells in the second pass |
+| `qc_review.embed_assets` | Always sidecar at 5,184 wells |
+| `cellenone.runs` | Plate name to `.Run` folder |
+| `resources.<rule>` | SLURM threads, memory, time, partition per rule |
+
+The `preprocessing:` block (UMI, barcode and trim offsets) and
+`aneufinder.plate384_models` are removed on this branch.
+
+## 11. Environments
 
 - Snakemake itself runs from the `snakemake_scDNA` conda environment set in
   `submit_pipeline.sh`.
-- Each rule uses a conda environment from `workflow/envs/`. These are built once and
-  shared under `.snakemake/conda` at the repo root, so every plate reuses them.
-- R analysis code uses `renv`. Restore it on a fresh checkout with
-  `R -e 'renv::restore()'`.
+- Each rule uses a conda environment from `workflow/envs/`, shared under
+  `.snakemake/conda` at the repo root. The RNA branch adds `workflow/envs/rna.yaml`
+  (planned).
+- R analysis code uses `renv`. Restore it with `R -e 'renv::restore()'`.
 
-## Repository layout
+## 12. Repository layout
 
 ```text
 scDNA_pipeline/
@@ -447,22 +431,38 @@ scDNA_pipeline/
 ├── submit_pipeline.sh       SLURM entry point
 ├── pre_check.sh             pre-flight checks
 ├── config/                  qc_decisions.csv schema and templates
-├── docs/                    CellenONE and QC notes, analysis write-ups
+├── docs/                    protocol notes, migration plan, CellenONE notes
 ├── resources/reference/     GC template and mappability resources
 ├── workflow/
-│   ├── envs/                per-rule conda environments
+│   ├── envs/
 │   └── scripts/
-│       ├── preprocessing/
 │       ├── analysis/
 │       ├── reporting/
-│       └── dev/
+│       └── rna/             (planned)
 ├── ad_hoc_checks/           one-off analyses, not part of the pipeline
-├── renv/, renv.lock
-└── Seqinfo/
+└── renv/, renv.lock
 ```
 
-## Further documentation
+## 13. Open items
 
+These are not decided. Do not fill them in without the user.
+
+1. **CellenONE position mapping.** How CellenONE names well positions for 384-well
+   and 5,184-well targets, and how they map to `well_map.tsv` (`cellenone_pos`).
+2. **Sequencing run configuration.** Instrument, read lengths and i5 orientation.
+   Only the minimum requirements in section 9 are known.
+3. **`well_id` format.** `R01C01` is a proposal.
+4. **Mappability reference and blacklist.** To be rebuilt from euploid cells
+   sequenced with wellDR-seq, because the current reference comes from the old
+   protocol.
+5. **Read cutoffs.** `usable_reads_pass_cutoff`, `usable_reads_warn_cutoff` and
+   `min_reads_for_model` to be re-tuned on wellDR-seq data.
+6. **AneuFinder bin size.** The pipeline uses 1 Mb; the authors used about 220 kb
+   variable bins. A change needs a matching GC template.
+
+## 14. Further documentation
+
+- [`docs/WELLDR_PLAN.md`](docs/WELLDR_PLAN.md): phased implementation plan for this branch
+- [`docs/CELLENONE_AND_QC.md`](docs/CELLENONE_AND_QC.md): how to read the review report and the CellenONE layer
 - [`config/README.md`](config/README.md): `qc_decisions.csv` schema and decision rules
-- [`docs/CELLENONE_AND_QC.md`](docs/CELLENONE_AND_QC.md): how to read the review report, and what CellenONE measures versus what the pipeline derives
-- [`FUTURE_PLANS.md`](FUTURE_PLANS.md): planned work
+- Wang et al. (2025), Cell 188, 6355-6369; author code at https://github.com/navinlabcode/wellDR-seq
