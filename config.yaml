@@ -142,6 +142,7 @@ cellenone:
   runs:
     plate21: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/input/P21_22/plate_2/K1563_plate_2_20260707_135300_812.Run"
     plate22: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/input/P21_22/plate_3/K1563_V_plate_3_20260707_142633_771.Run"
+    plate24: "/nemo/project/proj-tracerX/working/VCAM1_GnT/DATA/384_well/plate24/P1_K1570_V_20260902_142546_324.Run"
   min_object_diameter_um: null  # null -> DetDiaMinTrans read from that run's .xls
   # Contrast of the fluorescence overlay. <1 lifts faint stain so the colour is
   # obvious against the transmission image; the brightest pixels still saturate.
@@ -158,12 +159,15 @@ cellenone:
     # merge = transmission with every available fluorescence channel screen-blended
     # over it, as in the cellenONE PDF report. Individual channels are also written so
     # the reviewer can isolate one. Each extra channel is ~10 KB/well.
-    channels: [merge, trans, blue, orange, red]
+    # A run only records some of these; channels with no image or no signal are
+    # skipped at render time (plate21/22 = Blue + Orange, plate24 = Green + Orange).
+    channels: [merge, trans, blue, green, orange, red]
     annotate: true              # draw object outlines + index labels
   # Artificial colour per channel. These are DISPLAY colours named after the
   # instrument's own channel names (Blue / Orange / Red) — they are not the emission
   # wavelength and say nothing about which marker was used; see README.
-  tint: {blue: [0.25, 0.55, 1.0], orange: [1.0, 0.55, 0.1], red: [1.0, 0.25, 0.25]}
+  tint: {blue: [0.25, 0.55, 1.0], green: [0.25, 1.0, 0.35],
+         orange: [1.0, 0.55, 0.1], red: [1.0, 0.25, 0.25]}
 
 # Quality control thresholds
 qc_thresholds:

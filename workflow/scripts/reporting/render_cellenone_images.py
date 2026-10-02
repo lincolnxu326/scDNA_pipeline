@@ -56,7 +56,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage as ndi
 
-CHANNELS = ("trans", "blue", "orange", "red")
+CHANNELS = ("trans", "blue", "green", "orange", "red")
 
 
 def setup_logging():
@@ -232,7 +232,7 @@ def build_flu_reference(image_dir: Path, rows, sample: int, logger, shape=None):
     unused channel is dropped outright rather than shown as an empty overlay.
     """
     ref = {}
-    for ch in ("blue", "orange", "red"):
+    for ch in ("blue", "green", "orange", "red"):
         signal = [r for r in rows
                   if (r.get(f"{ch}_intensity") or "").strip() not in ("", "0", "0.0", "0.00")]
         names = sorted({r[f"img_{ch}"] for r in rows if r.get(f"img_{ch}")})
@@ -358,13 +358,29 @@ def draw_lines(draw: ImageDraw.ImageDraw, green_x, purple_x, height, scale):
         draw.line([(xs, 0), (xs, height)], fill=colour, width=max(1, int(2 * scale)))
 
 
-def annotate_objects(draw: ImageDraw.ImageDraw, objects, scale):
+# CellenONE's own particle taxonomy (cellenREPORT S4.3 "Isolation report"), reused so
+# our outlines read the same way as the vendor's scatter plots:
+#   isolated  green   the object actually dispensed into this well
+#   fitting   yellow  met the morphology gate but was not the one dispensed
+#   detected  pink    detected above the minimum, outside the isolation window
+# NB the vendor's gate also uses elongation and intensity; we measure equivalent
+# diameter only, so "fitting" here is a diameter-only approximation of theirs.
+CATEGORY_COLOUR = {
+    "isolated": (60, 220, 90),
+    "fitting": (255, 210, 40),
+    "detected": (255, 105, 180),
+}
+
+
+def annotate_objects(draw: ImageDraw.ImageDraw, objects, scale, categories=None):
     for i, o in enumerate(objects, start=1):
+        cat = (categories or {}).get(i, "detected")
+        colour = CATEGORY_COLOUR.get(cat, CATEGORY_COLOUR["detected"])
         r = max(4.0, o["diameter_px"] * 0.75) * scale
         x, y = o["x"] * scale, o["y"] * scale
-        draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 210, 40),
+        draw.ellipse([x - r, y - r, x + r, y + r], outline=colour,
                      width=max(1, int(2 * scale)))
-        draw.text((x + r + 2, y - r), str(i), fill=(255, 210, 40))
+        draw.text((x + r + 2, y - r), str(i), fill=colour)
 
 
 # Shared read-only worker state. Set once in the parent before the pool is created:
@@ -398,9 +414,22 @@ def render_well(row):
     # <1 lifts faint stain so the colour reads; the peak still saturates.
     flu_gamma = float(cfg.get("flu_gamma", 0.55))
 
+    def well_crit(key, fallback):
+        """This well's own gate, falling back to the run summary.
+
+        The criteria columns are per ROW in the run table, and an operator can change
+        them mid-run, so a single run-level number is wrong for whichever wells were
+        dispensed under the other setting."""
+        v = row.get(key)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return fallback
+        return f if f > 0 else fallback
+
     min_dia_um = cfg.get("min_object_diameter_um")
     if min_dia_um is None:
-        min_dia_um = crit.get("DetDiaMinTrans", 5.0)
+        min_dia_um = well_crit("det_dia_min", crit.get("DetDiaMinTrans", 5.0))
     px_per_um = float(meta.get("px_per_um") or 1.434)
 
     out = {"id": row["id"], "subplate": row["subplate"], "well": row["well"],
@@ -416,6 +445,7 @@ def render_well(row):
            "circularity": row.get("circularity", ""),
            "intensity": row.get("intensity", ""),
            "blue_intensity": row.get("blue_intensity", ""),
+           "green_intensity": row.get("green_intensity", ""),
            "orange_intensity": row.get("orange_intensity", ""),
            "red_intensity": row.get("red_intensity", "")}
     objs_out = []
@@ -435,18 +465,39 @@ def render_well(row):
     min_dia_px = float(min_dia_um) * px_per_um
     objects = [o for o in objects if o["diameter_px"] >= min_dia_px]
 
-    iso_lo = crit.get("IsoDiaMinTrans")
-    iso_hi = crit.get("IsoDiaMaxTrans")
+    iso_lo = well_crit("iso_dia_min", crit.get("IsoDiaMinTrans"))
+    iso_hi = well_crit("iso_dia_max", crit.get("IsoDiaMaxTrans"))
+
+    # Which object did CellenONE actually dispense? Its (X, Y) for this well is in the
+    # run table, so the nearest detected centroid is the isolated cell. Same pairing
+    # rule as the pixel-scale calibration, and for the same reason: the dispensed cell
+    # is often not the largest blob in the frame.
+    iso_index = None
+    try:
+        tx, ty = float(row.get("x")), float(row.get("y"))
+    except (TypeError, ValueError):
+        tx = ty = None
+    if tx is not None and objects:
+        best = min(range(len(objects)),
+                   key=lambda k: (objects[k]["x"] - tx) ** 2 + (objects[k]["y"] - ty) ** 2)
+        d = ((objects[best]["x"] - tx) ** 2 + (objects[best]["y"] - ty) ** 2) ** 0.5
+        if d <= 20:                      # no confident pairing -> claim nothing
+            iso_index = best + 1
+
     n_in_window = 0
+    categories = {}
     for i, o in enumerate(objects, start=1):
         dia_um = o["diameter_px"] / px_per_um
         in_window = (iso_lo is not None and iso_hi is not None
                      and iso_lo <= dia_um <= iso_hi)
         n_in_window += int(in_window)
+        cat = "isolated" if i == iso_index else ("fitting" if in_window else "detected")
+        categories[i] = cat
         objs_out.append({
             "id": row["id"], "object": i, "x": round(o["x"], 1), "y": round(o["y"], 1),
             "area_px": o["area_px"], "diameter_px": round(o["diameter_px"], 2),
             "diameter_um": round(dia_um, 2), "in_iso_window": int(in_window),
+            "category": cat,
             "side": ("right_of_purple" if o["x"] > purple_x else
                      "between_lines" if o["x"] > green_x else "left_of_green"),
         })
@@ -490,7 +541,7 @@ def render_well(row):
         d = ImageDraw.Draw(im)
         draw_lines(d, green_x, purple_x, oh, scale)
         if annotate and kind in ("merge", "trans"):
-            annotate_objects(d, objects, scale)
+            annotate_objects(d, objects, scale, categories)
         if badge:
             im = draw_badge(im, badge)
         name = f"{row['id']}_{kind}.jpg"
@@ -640,14 +691,15 @@ def main():
     well_fields = ["id", "subplate", "well", "pos384", "n_objects", "rightmost_x",
                    "rightmost_diameter_um", "n_in_iso_window", "image_call", "image_paths",
                    "diameter_um", "elongation", "circularity", "intensity",
-                   "blue_intensity", "orange_intensity", "red_intensity"]
+                   "blue_intensity", "green_intensity", "orange_intensity",
+                   "red_intensity"]
     with open(cdir / "cellenone_wells.tsv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=well_fields, delimiter="\t", lineterminator="\n")
         w.writeheader()
         w.writerows(well_rows)
 
     obj_fields = ["id", "object", "x", "y", "area_px", "diameter_px", "diameter_um",
-                  "in_iso_window", "side"]
+                  "in_iso_window", "category", "side"]
     with open(cdir / "objects.tsv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=obj_fields, delimiter="\t", lineterminator="\n")
         w.writeheader()

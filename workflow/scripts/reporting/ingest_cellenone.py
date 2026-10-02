@@ -9,7 +9,9 @@ What the run folder actually contains
 -------------------------------------
 * `Reordered_*_isolated.xls` — despite the extension this is **tab-separated text**
   with CRLF line endings and a run of empty trailing fields. One row per
-  (drop, channel): 384 Transmission + 384 Blue + 384 Orange (+ a few Red). Carries
+  (drop, channel): 384 Transmission + 384 of each fluorescence channel the run used.
+  Which channels exist varies per run: plate21/22 recorded Blue + Orange (+ a few
+  Red), plate24 recorded Green + Orange + Red. Carries
   the isolated cell's X/Y in the 952x471 camera frame, its diameter/elongation/
   circularity/intensity, and — importantly — the run's own detection and isolation
   criteria, which **vary per run** and must always be read from the file rather than
@@ -50,7 +52,7 @@ import json
 import logging
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import yaml
@@ -63,9 +65,10 @@ import plate384_layout as L384
 #   …_(K-22)Blue_K1563_plate_2_Run.png     <- note: no separator before Blue/Orange
 # The trailing guard is `(?![A-Za-z])`, NOT `\b`: the next character is `_`, which is
 # itself a word character, so `\b` never fires there.
-IMG_RE = re.compile(r"\(([A-Pa-p]-\d{1,2})\)_?(Trans|Blue|Orange|Red)(?![A-Za-z])", re.I)
+IMG_RE = re.compile(r"\(([A-Pa-p]-\d{1,2})\)_?(Trans|Blue|Green|Orange|Red)(?![A-Za-z])", re.I)
 HYPERLINK_RE = re.compile(r'=HYPERLINK\("([^"]*)"\)', re.I)
-CHANNEL_OF_TEG = {"transmission": "trans", "blue": "blue", "orange": "orange", "red": "red"}
+CHANNEL_OF_TEG = {"transmission": "trans", "blue": "blue", "green": "green",
+                  "orange": "orange", "red": "red"}
 
 
 def setup_logging():
@@ -310,13 +313,23 @@ def main():
                  "IsoDiaMinTrans", "IsoDiaMaxTrans", "IsoIntMinTrans", "IsoIntMaxTrans",
                  "IsoDiaMinFlu", "IsoDiaMaxFlu", "IsoIntMinFlu", "IsoIntMaxFlu"]
     criteria = {}
+    criteria_varied = {}
     for k in crit_keys:
-        vals = {r.get(k) for r in iso_rows if r.get(k) not in (None, "")}
-        if len(vals) == 1:
-            criteria[k] = as_float(vals.pop())
-        elif vals:
-            logger.warning("Criterion %s is not constant across rows: %s", k, sorted(vals))
-            criteria[k] = as_float(sorted(vals)[0])
+        vals = [as_float(r.get(k)) for r in iso_rows if r.get(k) not in (None, "")]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        counts = Counter(vals)
+        # The MODAL value, compared numerically. `sorted(["12","9"])[0]` is "12", so a
+        # string sort here silently picked a threshold by alphabet — and an operator
+        # really can change the criteria part-way through a run (plate22 does: 92 wells
+        # at IsoDiaMin 9 um, then 292 at 12, with IsoDiaMax moving 25 -> 30 too).
+        criteria[k] = counts.most_common(1)[0][0]
+        if len(counts) > 1:
+            criteria_varied[k] = {str(v): n for v, n in sorted(counts.items())}
+            logger.warning("Criterion %s changed during the run: %s — the per-well value "
+                           "is carried in wells_raw.tsv; run_meta records the modal %s",
+                           k, criteria_varied[k], criteria[k])
     logger.info("Run criteria: detection >= %s um, isolation window %s-%s um",
                 criteria.get("DetDiaMinTrans"),
                 criteria.get("IsoDiaMinTrans"), criteria.get("IsoDiaMaxTrans"))
@@ -359,7 +372,7 @@ def main():
     # needed: a per-run integer-pixel shift per channel is enough. A cell is ~24 px
     # across, so the ~8 px Orange offset is a third of a cell — worth correcting.
     offsets = {}
-    for channel in ("blue", "orange", "red"):
+    for channel in ("blue", "green", "orange", "red"):
         dxs, dys = [], []
         for pos, chans in by_pos_channel.items():
             t, f = chans.get("trans"), chans.get(channel)
@@ -412,9 +425,11 @@ def main():
     fieldnames = [
         "id", "subplate", "well", "pos384", "drop_no",
         "x", "y", "diameter_um", "elongation", "circularity", "intensity",
-        "blue_intensity", "blue_diameter_um", "orange_intensity", "orange_diameter_um",
-        "red_intensity", "red_diameter_um",
-        "img_trans", "img_blue", "img_orange", "img_red",
+        "blue_intensity", "blue_diameter_um", "green_intensity", "green_diameter_um",
+        "orange_intensity", "orange_diameter_um", "red_intensity", "red_diameter_um",
+        "img_trans", "img_blue", "img_green", "img_orange", "img_red",
+        # This well's OWN gate, not the run summary — see criteria_varied above.
+        "det_dia_min", "iso_dia_min", "iso_dia_max",
     ]
     out_rows = []
     matched = 0
@@ -425,7 +440,7 @@ def main():
         imgs = images.get(pos, {})
         t = chans.get("trans", {})
         blue, orange = chans.get("blue", {}), chans.get("orange", {})
-        red = chans.get("red", {})
+        green, red = chans.get("green", {}), chans.get("red", {})
         if chans or imgs:
             matched += 1
         else:
@@ -438,12 +453,18 @@ def main():
             "circularity": t.get("Circularity", ""), "intensity": t.get("Intensity", ""),
             "blue_intensity": blue.get("Intensity", ""),
             "blue_diameter_um": blue.get("Diameter", ""),
+            "green_intensity": green.get("Intensity", ""),
+            "green_diameter_um": green.get("Diameter", ""),
             "orange_intensity": orange.get("Intensity", ""),
             "orange_diameter_um": orange.get("Diameter", ""),
             "red_intensity": red.get("Intensity", ""),
             "red_diameter_um": red.get("Diameter", ""),
             "img_trans": imgs.get("trans", ""), "img_blue": imgs.get("blue", ""),
-            "img_orange": imgs.get("orange", ""), "img_red": imgs.get("red", ""),
+            "img_green": imgs.get("green", ""), "img_orange": imgs.get("orange", ""),
+            "img_red": imgs.get("red", ""),
+            "det_dia_min": t.get("DetDiaMinTrans", ""),
+            "iso_dia_min": t.get("IsoDiaMinTrans", ""),
+            "iso_dia_max": t.get("IsoDiaMaxTrans", ""),
         })
 
     # Report both directions of mismatch rather than silently dropping either side.
@@ -473,6 +494,7 @@ def main():
         "run_name": run_dir.name,
         "lines": resolve_lines(run_dir, cfg, logger),
         "criteria": criteria,
+        "criteria_varied": criteria_varied,
         "par_tparameters": par_params,
         "channel_offsets": offsets,
         "run_stats": run_stats,

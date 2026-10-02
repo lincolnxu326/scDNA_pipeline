@@ -705,7 +705,7 @@ def main():
                 if not name:
                     continue
                 channel = name.rsplit("_", 1)[-1].rsplit(".", 1)[0]
-                if channel not in ("merge", "trans", "blue", "orange", "red"):
+                if channel not in ("merge", "trans", "blue", "green", "orange", "red"):
                     continue
                 uri = assets.ref(Path(args.cellenone_dir) / "images" / name)
                 if uri:
@@ -722,7 +722,7 @@ def main():
             cell_elong = as_number(cw.get("elongation"), float)
             cell_circ = as_number(cw.get("circularity"), float)
             cell_int = as_number(cw.get("intensity"), float)
-            for _ch in ("blue", "orange", "red"):
+            for _ch in ("blue", "green", "orange", "red"):
                 _v = as_number(cw.get(f"{_ch}_intensity"), float)
                 # 0 means the channel recorded nothing for this cell — report it as
                 # absent rather than as a measured zero. (Red was not a configured
@@ -1047,6 +1047,13 @@ __QC_CSS__
               <img id="plate-img" alt="CellenONE image" hidden>
               <span class="nozzle">nozzle &#8592;</span>
               <span class="cap" id="plate-cap"></span>
+            </div>
+            <!-- Outline colours follow cellenONE's own particle taxonomy
+                 (cellenREPORT S4.3), so a reviewer reading both sees the same words. -->
+            <div class="objkey micro" id="objkey">
+              <span><i style="background:#3cdc5a"></i>isolated</span>
+              <span><i style="background:#ffd228"></i>fits criteria</span>
+              <span><i style="background:#ff69b4"></i>detected</span>
             </div>
           </div>
           <div class="img-metrics" id="img-metrics">
