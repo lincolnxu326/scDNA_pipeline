@@ -45,3 +45,8 @@ design/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Local agent state, prompt drafts, and copyrighted reference papers
+.claude/
+Claude outputs/
+docs/references/

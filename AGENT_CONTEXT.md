@@ -2,16 +2,31 @@
 
 ## Branch `welldr`: read this first
 
-This branch targets the wellDR-seq protocol (Wang et al., Cell 188, 6355-6369, 2025).
-`docs/WELLDR_PLAN.md` is the source of truth for the migration: protocol facts,
-decisions, open items, the change inventory and the phases. Follow it one phase at a
-time.
+This branch targets the wellDR-seq protocol (Wang et al., Cell 188, 6355-6369, 2025)
+and is the default development branch. Legacy behaviour (NlaIII library, in-pipeline
+demultiplexing, UMI-tools deduplication, 384 subplate mode) lives on branch `dlp+`.
+
+### Before doing anything else
+
+1. Read, in this order:
+   - `README.md` (the target pipeline and its output contracts);
+   - `docs/WELLDR_PLAN.md` (the source of truth for the migration: protocol facts,
+     decisions, open items, change inventory, phases);
+   - `docs/WELLDR_BRANCH_SETUP_PROMPT.md` (the original brief, for the reasoning
+     behind the plan; it has already been carried out, do not run it again).
+2. Work out where the migration stands: which phases in `docs/WELLDR_PLAN.md` are
+   done (check `git log` and the code), and which open items in section 3.2 are still
+   open.
+3. Before writing any code, explain the plan to the user in a few sentences: the
+   goal, the phase the branch is in, what the next phase would change, and the open
+   items that block it. Then ask what they want to do. This applies whether the user
+   wants to develop the pipeline or only to understand it.
+4. Work one phase at a time and stop for user review at the end of each phase, as
+   the plan says.
 
 The rest of this file describes the legacy pipeline as it stood when the branch was
-created. Legacy behaviour (NlaIII library, in-pipeline demultiplexing, UMI-tools
-deduplication, 384 subplate mode) lives on branch `dlp+`. Sections below on those
-topics apply to `dlp+` only. The AneuFinder / GC / blacklist warnings still apply
-here.
+created. Sections on legacy-only topics apply to `dlp+` only. The AneuFinder / GC /
+blacklist warnings still apply here.
 
 ## Purpose
 
@@ -67,10 +82,6 @@ the strict production workflow.
 - `submit_pipeline.sh`
   - main launch script for cluster execution
 - `pre_check.sh`
-  - user-facing helper
-- `generate_rule_graph.sh`
-  - user-facing helper
-- `test.sh`
   - user-facing helper
 - `workflow/scripts/`
   - pipeline-owned execution scripts
@@ -154,8 +165,6 @@ So these are intentionally top-level and should stay easy to discover:
 
 - `submit_pipeline.sh`
 - `pre_check.sh`
-- `generate_rule_graph.sh`
-- `test.sh`
 
 Do not bury these under a helper subdirectory unless the user explicitly asks.
 

@@ -463,6 +463,8 @@ These are not decided. Do not fill them in without the user.
 ## 14. Further documentation
 
 - [`docs/WELLDR_PLAN.md`](docs/WELLDR_PLAN.md): phased implementation plan for this branch
+- [`docs/WELLDR_BRANCH_SETUP_PROMPT.md`](docs/WELLDR_BRANCH_SETUP_PROMPT.md): the original brief behind the plan (record only)
+- [`AGENT_CONTEXT.md`](AGENT_CONTEXT.md): start here if you use a coding agent on this repo
 - [`docs/CELLENONE_AND_QC.md`](docs/CELLENONE_AND_QC.md): how to read the review report and the CellenONE layer
 - [`config/README.md`](config/README.md): `qc_decisions.csv` schema and decision rules
 - Wang et al. (2025), Cell 188, 6355-6369; author code at https://github.com/navinlabcode/wellDR-seq
